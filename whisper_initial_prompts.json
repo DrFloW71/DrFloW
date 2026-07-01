@@ -1,0 +1,9 @@
+[
+  {
+    "id": "medical_general",
+    "name": "Médical général",
+    "content": "Consultation de médecine générale en français. Vocabulaire possible : médecin, patient, symptômes, traitements, posologies, tension artérielle, saturation, température, douleur, fièvre, toux, dyspnée, diarrhée, vomissements, HTA, diabète, ECG, CRP, HbA1c, DFG, SpO2.",
+    "is_default": true,
+    "prompt_type": "generic"
+  }
+]

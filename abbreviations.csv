@@ -1,0 +1,170 @@
+find,replace
+accident de travail,AW
+accident ischemique transitoire,AIT
+aide medicale d etat,AME
+analyse d urine,ECBU
+antibiotique,ATB
+antibio,ATB
+anticoagulant oral,AVK
+antecedents,ATCD
+antecedents chirurgicaux,ATCD Chir
+antecedents familiaux,ATCD Fam
+antecedents medicaux,ATCD Med
+anti inflammatoire,AINS
+apnee du sommeil,SAHOS
+arret maladie,AM
+arret de travail,AM
+automesures tensionnelles,AMT
+avc,AVC
+bacille de koch,BK
+battements cardiaques,FC
+bcg,BCG
+bilan hepatique,BH
+bilan lipidique,BL
+bilan preoperatoire,PreOp
+bilan renal,Creat
+bilan thyroidien,BT
+bronchite chronique,BPCO
+bmi,IMC
+bêta bloquant,BBloq
+cardiogramme,ECG
+centre hospitalier,CH
+compte rendu,CR
+consultation,CS
+contre indication,CI
+creatinine,Creat
+crise cardiaque,SCA
+cystite,IU
+diabete de type 1,DT1
+diabete de type 2,DT2
+diarrhee infectieuse,GEA
+echo,ECHO
+echographie,ECHO
+echographie abdominale,EchoAbdo
+electrocardiogramme,ECG
+electrocardio,ECG
+embolie pulmonaire,EP
+emphyseme,BPCO
+ergotherapie,Ergo
+explorations fonctionnelles respiratoires,EFR
+examen cytobacteriologique des urines,ECBU
+fibrillation auriculaire,FA
+formule sanguine,NFS
+frequence cardiaque,FC
+frequence respiratoire,FR
+frottis cervico vaginal,FCV
+gastro enterite aigue,GEA
+gaz arteriels,GDS
+gaz du sang,GDS
+globules blancs,GB
+glucose,Gly
+glycemie,Gly
+helicobacter pylori,HP
+hemogramme,NFS
+hepatite b,HBV
+hemoglobine glyquee,HbA1c
+hopital de jour,HDJ
+hospitalisation a domicile,HAD
+hypertension arterielle,HTA
+implant contraceptif,Implant
+indice de masse corporelle,IMC
+infarctus du myocarde,IDM
+infarctus,SCA
+infection urinaire,IU
+infection urinaire chez l homme,IUM
+infirmier liberal,IDE
+infirmiere en pratique avancee,IPA
+inhibiteur calcique,ICa
+inhibiteur enzyme conversion,IEC
+insuffisance cardiaque,IC
+insuffisance renale,IRC
+insuffisance renale aigue,IRA
+insuffisance respiratoire,IRE
+insuffisance veineuse,IV
+irm,IRM
+irm cerebrale,IRMc
+leucocytes,GB
+ligament croise anterieur,LCA
+mammographie,Mammo
+maladie auto immune,MAI
+maladie veineuse thromboembolique,MVTE
+mici,MICI
+motricite fine,MF
+motricite globale,MG
+medecin traitant,MT
+numeration formule sanguine,NFS
+oedeme des membres inferieurs,OMI
+oedeme pulmonaire,OAP
+oxygene,O2
+papillomavirus,HPV
+pas venu pas prevenu,PVPP
+perf,VVP
+perfusions,VVP
+perimetre cranien,PC
+pilule contraceptive,Pilule
+phlebite,TVP
+pouls,FC
+pression arterielle,PA
+prolongation d arret de travail,prol AM
+prolongation d arret maladie,prol AM
+prolongation d accident de travail,prol AW
+prothese de genou,PTG
+prothese du genou,PTG
+prothese de hanche,PTH
+proteine C reactive,CRP
+prise en charge,PEC
+pyelonephrite,PNA
+radiographie,Rx
+radiographie thoracique,RxTho
+radio,Rx
+reaction en chaine,PCR
+rectocolite hemorragique,RCH
+reflux gastro oesophagien,RGO
+renouvellement d ordonnance,RO
+resonance magnetique,IRM
+rendez vous,RDV
+rendez vous non honore,PVPP
+rien a signaler,RAS
+sartan,ARA2
+saturation,SpO2
+saturation en oxygene,SpO2
+scanner,TDM
+serologie,Sero
+serologie hepatite B,SeroHBV
+serologie rubeole,SeroRub
+serologie syphilis,SeroTPHA
+serologie toxoplasmose,SeroToxo
+serologie VIH,SeroVIH
+spirometrie,EFR
+sucre,Gly
+suivi mensuel,SM
+tension,PA
+tension arterielle,PA
+tension elevee,HTA
+test pcr,PCR
+test de depistage colorectal,Hemoccult
+test tuberculose,BK
+therapie cognitive,TC
+thyroide,THYR
+tomodensitometrie,TDM
+tomographie,TDM
+traitement,TTT
+trouble deficitaire de l attention,TDA
+trouble deficitaire de l attention avec hyperactivite,TDAH
+trouble neuro cognitif,TNC
+trouble neurodeveloppemental,TND
+trouble obsessionnel compulsif,TOC
+trouble du spectre autistique,TSA
+tour de tete,PC
+transaminase,ALAT
+transaminases,ALAT
+urgences,URG
+urines,ECBU
+vaccin dtp,DTP
+vaccin ror,ROR
+vaccin tetanos,DTP
+vitamine B12,VitB12
+vitamine D,VitD
+vitesse de sedimentation,VS
+orthèse d'avancée mandibulaire, OAM
+index d'apnées et hypopnées, IAH

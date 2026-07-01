@@ -1,0 +1,204 @@
+{
+  "whisper": {
+    "default_model": "large-v3",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": "fr",
+    "segment_seconds": 15,
+    "overlap_seconds": 1,
+    "sample_rate": 16000,
+    "input_device": "",
+    "cpu_threads": 16,
+    "beam_size": 5,
+    "vad_filter": true,
+    "min_silence_duration_ms": 700,
+    "speech_pad_ms": 200,
+    "task": "transcribe",
+    "force_language": true,
+    "disable_language_detection": true,
+    "condition_on_previous_text": false,
+    "initial_prompt": "Consultation de médecine générale en français. Vocabulaire possible : médecin, patient, symptômes, traitements, posologies, tension artérielle, saturation, température, douleur, fièvre, toux, dyspnée, diarrhée, vomissements, HTA, diabète, ECG, CRP, HbA1c, DFG, SpO2.",
+    "initial_prompt_name": "Médical général"
+  },
+  "stt": {
+    "default_engine": "voxtral",
+    "allow_experimental_engines": true,
+    "keep_audio_for_benchmark": true,
+    "auto_fallback_to_faster_whisper": true,
+    "show_engine_warnings": true,
+    "speaker_map": {
+      "SPEAKER_00": "Médecin",
+      "SPEAKER_01": "Patient"
+    },
+    "stt_context_bias": "HTA, diabète de type 2, fibrillation auriculaire, insuffisance cardiaque, Eliquis, Kardégic, metformine, Forxiga, Ozempic, HbA1c, DFG, BNP, SpO2."
+  },
+  "faster_whisper": {
+    "enabled": true,
+    "model": "large-v3",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": "fr",
+    "task": "transcribe",
+    "force_language": true,
+    "disable_language_detection": true,
+    "segment_seconds": 15,
+    "overlap_seconds": 1,
+    "temperature": 0.0,
+    "beam_size": 5,
+    "vad_filter": true,
+    "vad_parameters": {
+      "min_silence_duration_ms": 700,
+      "speech_pad_ms": 200
+    },
+    "min_silence_duration_ms": 700,
+    "speech_pad_ms": 200,
+    "condition_on_previous_text": false,
+    "no_speech_threshold": 0.6,
+    "log_prob_threshold": -1.0,
+    "compression_ratio_threshold": 2.4,
+    "initial_prompt": "Consultation de médecine générale en français. Vocabulaire possible : médecin, patient, symptômes, traitements, posologies, tension artérielle, saturation, température, douleur, fièvre, toux, dyspnée, diarrhée, vomissements, HTA, diabète, ECG, CRP, HbA1c, DFG, SpO2."
+  },
+  "audio_filter": {
+    "enabled": true,
+    "min_rms_for_transcription": 0.0015,
+    "min_peak_for_transcription": 0.02,
+    "min_duration_seconds": 0.8,
+    "skip_silent_segments": true,
+    "log_skipped_segments": true
+  },
+  "transcription_cleaning": {
+    "enabled": true,
+    "remove_technical_blocks": true,
+    "remove_known_asr_artifacts": true,
+    "normalize_blood_pressure": true,
+    "blocked_line_patterns": [
+      "Sous-titrage",
+      "Société Radio-Canada",
+      "ST' 501",
+      "Transcription fidèle",
+      "mauvais micro",
+      "Segment sans texte détecté",
+      "silence ou mauvais micro",
+      "Merci d’avoir regardé",
+      "N’oubliez pas de vous abonner",
+      "Thanks for watching",
+      "subtitle",
+      "subtitles",
+      "caption",
+      "captions"
+    ]
+  },
+  "qwen3_asr": {
+    "enabled": true,
+    "model": "Qwen3-ASR-1.7B",
+    "runtime": "auto",
+    "device": "cuda",
+    "language": "fr",
+    "mode": "batch",
+    "timeout_seconds": 300,
+    "external_cli_command": ""
+  },
+  "voxtral": {
+    "enabled": true,
+    "model": "Voxtral-Mini-3B",
+    "runtime": "auto",
+    "device": "cuda",
+    "language": "fr",
+    "mode": "batch",
+    "enable_diarization": false,
+    "enable_word_timestamps": false,
+    "enable_context_biasing": true,
+    "timeout_seconds": 300,
+    "server_url": "http://127.0.0.1:8000",
+    "external_cli_command": ""
+  },
+  "lmstudio": {
+    "url": "http://localhost:1234/v1/chat/completions",
+    "model": "local-model",
+    "temperature": 0.2,
+    "timeout_seconds": 120,
+    "default_system_prompt": "Tu es un assistant médical local.",
+    "use_json_schema_response_format": false
+  },
+  "message_composition": {
+    "include_prompt": true,
+    "include_weda_context": false,
+    "include_transcription": true
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "ui": {
+    "show_sent_message": true,
+    "show_weda_context": true,
+    "save_history": true,
+    "window_width": 1921,
+    "window_height": 1039
+  },
+  "weda": {
+    "context_capture_delay_seconds": 20
+  },
+  "pdf": {
+    "templates_dir": "data/pdf_templates",
+    "outputs_dir": "data/pdf_outputs",
+    "open_after_export": true,
+    "require_manual_validation": true,
+    "allow_pdf_without_fields": false,
+    "default_prompt_id": "pdf_form_fill",
+    "preferred_source": "Contexte + transcription",
+    "max_tokens": 8192
+  },
+  "secondary_analysis": {
+    "enabled": true,
+    "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184",
+    "auto_run_after_primary": true,
+    "include_transcription": true,
+    "include_weda_context": true,
+    "include_result_1": true,
+    "show_sent_message_2": true,
+    "allow_manual_run": true
+  },
+  "tertiary_analysis": {
+    "enabled": false,
+    "default_prompt_id": "5474267cf94c4c71bfc13708af00cc14",
+    "auto_run_after_secondary": true,
+    "include_transcription": true,
+    "include_weda_context": true,
+    "include_result_1": true,
+    "include_result_2": true,
+    "show_sent_message_3": true,
+    "allow_manual_run": true
+  },
+  "abbreviations": {
+    "include_in_lmstudio_prompt": true
+  },
+  "fly_dictation": {
+    "enabled": true,
+    "key": "²",
+    "model": "large-v3-turbo",
+    "min_seconds": 0.2,
+    "paste_delay_ms": 0,
+    "beam_size": 1,
+    "best_of": 1,
+    "temperature": 0.0,
+    "vad_filter": false,
+    "condition_on_previous_text": false,
+    "min_silence_duration_ms": 250,
+    "initial_prompt": "Dictée médicale courte en français. Respecter les termes médicaux, médicaments, posologies, unités et abréviations usuelles. Ne pas traduire. Ne pas produire d’anglais.",
+    "preload_model": true
+  },
+  "connector": {
+    "enabled": true,
+    "start_key": "Insert",
+    "stop_key": "End",
+    "stop_transcription_grace_seconds": 2,
+    "auto_return_home": true
+  },
+  "security": {
+    "auto_delete_audio": true,
+    "require_manual_validation_before_lmstudio": true,
+    "require_manual_validation_before_weda_import": true,
+    "block_import_if_patient_changed": true
+  }
+}
