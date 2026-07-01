@@ -1,2 +1,2 @@
 # DrFloW
-Assistant local de consultation médicale.
+Permet un transfert de données automatique entre Heidi et Weda.
