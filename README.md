@@ -11,7 +11,7 @@ Le raccourci de lancement de DrFloW utilise `lancer_assistant_weda_silencieux.vb
 Pour lancer en mode dépannage avec une console visible :
 
 ```powershell
-cd "C:\Users\flori\Documents\GitHub\gemma_weda_assistant"
+cd "C:\Users\flori\Documents\GitHub\DrFloW"
 .\lancer_assistant_weda.cmd --debug
 ```
 
@@ -27,6 +27,24 @@ Le serveur local de l’application démarre avec l’interface sur :
 
 ```text
 http://127.0.0.1:8765
+```
+
+## Sécurité GitHub
+
+Ce dépôt ne doit jamais contenir de donnée personnelle, privée ou patient.
+
+Les fichiers locaux à risque restent ignorés par Git : `data/`, logs, historiques, audios, exports PDF/Word/Excel/CSV, bases locales, fichiers `.env` et clés/secrets.
+
+Avant de publier ou committer, lancer :
+
+```powershell
+python tools/check_private_data.py
+```
+
+Le hook de pré-commit local lance ce contrôle automatiquement. Pour le réactiver si besoin :
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\install_git_hooks.ps1
 ```
 
 ## Prototype actuel

@@ -84,7 +84,7 @@ class LocalServer:
                 parsed = urlparse(self.path)
                 if parsed.path == "/health":
                     state._log("info", "server", "health", "Healthcheck reçu.")
-                    self._send_json({"ok": True, "service": "gemma_weda_assistant"})
+                    self._send_json({"ok": True, "service": "drflow"})
                     return
 
                 if parsed.path == "/weda/context":
