@@ -17,7 +17,7 @@
     "force_language": true,
     "disable_language_detection": true,
     "condition_on_previous_text": false,
-    "initial_prompt": "Consultation de médecine générale en français. Vocabulaire possible : médecin, patient, symptômes, traitements, posologies, tension artérielle, saturation, température, douleur, fièvre, toux, dyspnée, diarrhée, vomissements, HTA, diabète, ECG, CRP, HbA1c, DFG, SpO2.",
+    "initial_prompt": "Consultation de médecine générale en français.",
     "initial_prompt_name": "Médical général"
   },
   "stt": {
@@ -150,7 +150,7 @@
     "max_tokens": 8192
   },
   "secondary_analysis": {
-    "enabled": true,
+    "enabled": false,
     "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184",
     "auto_run_after_primary": true,
     "include_transcription": true,
@@ -171,7 +171,7 @@
     "allow_manual_run": true
   },
   "document_now": {
-    "default_prompt_id": "document_now_default"
+    "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184"
   },
   "abbreviations": {
     "include_in_lmstudio_prompt": true
@@ -193,7 +193,7 @@
   },
   "connector": {
     "enabled": true,
-    "start_key": "Insert",
+    "start_key": "Home",
     "stop_key": "End",
     "stop_transcription_grace_seconds": 2,
     "auto_return_home": true

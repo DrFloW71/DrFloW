@@ -151,6 +151,7 @@ PDF_SOURCE_CHOICES = (
     "Résultat 1",
     "Résultat 2",
     "Résultat 3",
+    "Document maintenant",
     "Résultat 1 + Résultat 2",
     "Résultat 1 + Résultat 2 + Résultat 3",
 )
@@ -1029,6 +1030,10 @@ class AssistantApp:
             parent_notebook=self.document_now_notebook,
             buttons=[("Prévisualiser message", self.preview_document_now_message)],
             readonly=True,
+            message_controls=True,
+            message_send_command=self.send_document_now_from_message_tab,
+            message_send_label="Document maintenant",
+            message_spinner_key=DOCUMENT_NOW_SPINNER_KEY,
         )
         self.document_now_result_text = self._add_text_tab(
             "Résultat",
@@ -1037,6 +1042,11 @@ class AssistantApp:
                 ("Copier résultat", self.copy_document_now_result),
                 ("Regénérer depuis snapshot", self.regenerate_document_now_from_snapshot),
                 ("Effacer résultat", self.clear_document_now_result),
+                ("Importer Document maintenant dans WEDA", self.prepare_weda_import_document_now),
+            ],
+            destination_controls=True,
+            destination_buttons=[
+                ("Utiliser Document maintenant pour PDF structuré", self.use_document_now_result_for_pdf),
             ],
         )
         self.pdf_tab_frame = self._add_pdf_structured_tab()
@@ -1261,6 +1271,9 @@ class AssistantApp:
         check_context: bool = False,
         message_controls: bool = False,
         message_document_index: int = 1,
+        message_send_command=None,
+        message_send_label: str = "Envoyer à LM Studio",
+        message_spinner_key: str | None = None,
         destination_controls: bool = False,
         destination_buttons=None,
     ) -> tk.Text:
@@ -1273,7 +1286,13 @@ class AssistantApp:
         for label, command in buttons or []:
             ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
         if message_controls:
-            self.add_message_composition_controls(toolbar, document_index=message_document_index)
+            self.add_message_composition_controls(
+                toolbar,
+                document_index=message_document_index,
+                send_command=message_send_command,
+                send_label=message_send_label,
+                spinner_key=message_spinner_key,
+            )
         if destination_controls:
             self.add_result_destination_controls(toolbar)
             for label, command in destination_buttons or []:
@@ -1295,7 +1314,14 @@ class AssistantApp:
             text.configure(state=tk.DISABLED)
         return text
 
-    def add_message_composition_controls(self, toolbar: ttk.Frame, document_index: int = 1) -> None:
+    def add_message_composition_controls(
+        self,
+        toolbar: ttk.Frame,
+        document_index: int = 1,
+        send_command=None,
+        send_label: str = "Envoyer à LM Studio",
+        spinner_key: str | None = None,
+    ) -> None:
         ttk.Label(toolbar, text="Envoyer").pack(side=tk.LEFT, padx=(12, 4))
         for label, variable in (
             ("Prompt", self.include_prompt_var),
@@ -1312,11 +1338,11 @@ class AssistantApp:
         ttk.Button(toolbar, text="Vider fichiers", command=self.clear_message_attachments).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             toolbar,
-            text="Envoyer à LM Studio",
-            command=lambda index=document_index: self.send_document_to_lmstudio(index),
+            text=send_label,
+            command=send_command or (lambda index=document_index: self.send_document_to_lmstudio(index)),
             style="Accent.TButton",
         ).pack(side=tk.LEFT, padx=(0, 6))
-        self.register_lmstudio_spinner(toolbar, self.document_lmstudio_spinner_key(document_index))
+        self.register_lmstudio_spinner(toolbar, spinner_key or self.document_lmstudio_spinner_key(document_index))
         ttk.Label(toolbar, textvariable=self.message_attachment_status_var).pack(side=tk.LEFT, padx=(0, 6))
 
     def add_result_destination_controls(self, toolbar: ttk.Frame) -> None:
@@ -1468,8 +1494,8 @@ class AssistantApp:
             ("Prévisualiser message", self.preview_document_now_message),
             ("Document maintenant", self.document_now_checkpoint),
         ):
-            ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
-        self.register_lmstudio_spinner(toolbar, DOCUMENT_NOW_SPINNER_KEY)
+            button_style = "Accent.TButton" if label == "Document maintenant" else "TButton"
+            ttk.Button(toolbar, text=label, command=command, style=button_style).pack(side=tk.LEFT, padx=(0, 6))
 
         text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1847,17 +1873,17 @@ class AssistantApp:
             prompt = self.prompt_manager.create(
                 DOCUMENT_NOW_PROMPT_NAME,
                 DEFAULT_DOCUMENT_NOW_PROMPT,
-                is_default=True,
-                prompt_type="document_now",
+                is_default=False,
+                prompt_type="generic",
                 prompt_id=DOCUMENT_NOW_PROMPT_ID,
             )
-        elif prompt.prompt_type != "document_now":
-            prompt = self.prompt_manager.update(prompt.id, prompt_type="document_now")
+        elif prompt.prompt_type != "generic":
+            prompt = self.prompt_manager.update(prompt.id, prompt_type="generic")
 
         default_prompt_id = str(document_now_config.get("default_prompt_id") or "")
         selected = self.prompt_manager.get(default_prompt_id)
         changed = False
-        if selected is None or selected.prompt_type != "document_now":
+        if selected is None or selected.prompt_type != "generic":
             document_now_config["default_prompt_id"] = prompt.id
             changed = True
         if changed:
@@ -2146,6 +2172,9 @@ class AssistantApp:
         result_1 = self.get_text(self.result_text).strip()
         result_2 = self.get_text(self.secondary_result_text).strip()
         result_3 = self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else ""
+        document_now_result = (
+            self.get_text(self.document_now_result_text).strip() if hasattr(self, "document_now_result_text") else ""
+        )
         source = self.pdf_source_var.get() or "Résultat 1 + Résultat 2"
         if source == "Contexte + transcription":
             return self.build_pdf_context_transcription_source_text()
@@ -2157,6 +2186,8 @@ class AssistantApp:
             return result_2
         if source == "Résultat 3":
             return result_3
+        if source == "Document maintenant":
+            return document_now_result
         parts = []
         if result_1:
             parts.append("RÉSULTAT 1 :\n" + result_1)
@@ -2242,6 +2273,11 @@ class AssistantApp:
                 "result_1": self.get_text(self.result_text).strip(),
                 "result_2": self.get_text(self.secondary_result_text).strip(),
                 "result_3": self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else "",
+                "document_now_result": (
+                    self.get_text(self.document_now_result_text).strip()
+                    if hasattr(self, "document_now_result_text")
+                    else ""
+                ),
                 "pdf_fields": json.dumps(self.pdf_current_fields, ensure_ascii=False, indent=2),
                 "pdf_schema": json.dumps(schema, ensure_ascii=False, indent=2),
             }
@@ -2331,6 +2367,11 @@ class AssistantApp:
                 "result_1": self.get_text(self.result_text),
                 "result_2": self.get_text(self.secondary_result_text),
                 "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
+                "document_now_result": (
+                    self.get_text(self.document_now_result_text)
+                    if hasattr(self, "document_now_result_text")
+                    else ""
+                ),
                 "pdf_source": self.pdf_source_var.get(),
                 "pdf_template_id": self.pdf_current_template_id,
                 "pdf_template_name": self.pdf_current_metadata.get("name", ""),
@@ -2467,6 +2508,11 @@ class AssistantApp:
                 "result_1": self.get_text(self.result_text),
                 "result_2": self.get_text(self.secondary_result_text),
                 "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
+                "document_now_result": (
+                    self.get_text(self.document_now_result_text)
+                    if hasattr(self, "document_now_result_text")
+                    else ""
+                ),
                 "pdf_source": self.pdf_source_var.get(),
                 "status": "pdf_exported",
             }
@@ -2523,12 +2569,15 @@ class AssistantApp:
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_message_refresh())
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_secondary_message_refresh())
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
+        self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_document_now_message_refresh())
         self.include_context_var.trace_add("write", lambda *_args: self.schedule_message_refresh())
         self.include_context_var.trace_add("write", lambda *_args: self.schedule_secondary_message_refresh())
         self.include_context_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
+        self.include_context_var.trace_add("write", lambda *_args: self.schedule_document_now_message_refresh())
         self.include_transcription_var.trace_add("write", lambda *_args: self.schedule_message_refresh())
         self.include_transcription_var.trace_add("write", lambda *_args: self.schedule_secondary_message_refresh())
         self.include_transcription_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
+        self.include_transcription_var.trace_add("write", lambda *_args: self.schedule_document_now_message_refresh())
         self.secondary_enabled_var.trace_add("write", lambda *_args: self.schedule_secondary_message_refresh())
         self.secondary_enabled_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
         self.tertiary_enabled_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
@@ -2797,6 +2846,11 @@ class AssistantApp:
                 "result_1": self.get_text(self.result_text),
                 "result_2": self.get_text(self.secondary_result_text),
                 "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
+                "document_now_result": (
+                    self.get_text(self.document_now_result_text)
+                    if hasattr(self, "document_now_result_text")
+                    else ""
+                ),
                 "transcription": self.get_clean_transcription_text(),
                 "weda_context": self.get_text(self.context_text),
             }
@@ -2859,13 +2913,18 @@ class AssistantApp:
 
     def build_document_now_prompt_variables(self, snapshot: DocumentNowSnapshot) -> dict[str, str]:
         variables = self.build_prompt_variables()
-        patient_details = snapshot.patient_details or ""
+        include_prompt = bool(self.include_prompt_var.get())
+        include_context = bool(self.include_context_var.get())
+        include_transcription = bool(self.include_transcription_var.get())
+        patient_details = (snapshot.patient_details or "") if include_prompt or include_context else ""
+        snapshot_transcription = (snapshot.transcript_text or "") if include_transcription else ""
+        weda_context = (snapshot.weda_context or "") if include_context else ""
         variables.update(
             {
-                "transcription": snapshot.transcript_text or "",
-                "snapshot_transcription": snapshot.transcript_text or "",
-                "snapshot_de_transcription": snapshot.transcript_text or "",
-                "weda_context": snapshot.weda_context or "",
+                "transcription": snapshot_transcription,
+                "snapshot_transcription": snapshot_transcription,
+                "snapshot_de_transcription": snapshot_transcription,
+                "weda_context": weda_context,
                 "patient_details": patient_details,
                 "patient_identity": patient_details or variables.get("patient_identity", ""),
                 "current_date": snapshot.date_today,
@@ -2930,9 +2989,11 @@ class AssistantApp:
             f"preview-{uuid.uuid4().hex[:8]}",
             status="preview",
         )
-        prompt_content = self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
-            snapshot.prompt_content or DEFAULT_DOCUMENT_NOW_PROMPT
-        )
+        prompt_content = (
+            self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
+                snapshot.prompt_content or DEFAULT_DOCUMENT_NOW_PROMPT
+            )
+        ) if self.include_prompt_var.get() else ""
         prompt_id = self.current_document_now_prompt_id()
         prompt = self.prompt_manager.get(prompt_id) if prompt_id else None
         snapshot.prompt_id = prompt.id if prompt else prompt_id or snapshot.prompt_id
@@ -2941,6 +3002,7 @@ class AssistantApp:
         variables = self.build_document_now_prompt_variables(snapshot)
         message = self.prompt_manager.render_prompt(prompt_content, variables) if prompt_content.strip() else ""
         message = self.append_missing_document_now_sections(prompt_content, message, variables)
+        message = self.append_message_attachment_section(prompt_content, message, variables)
         return message, variables, snapshot
 
     def refresh_document_now_sent_message(self) -> str:
@@ -2998,6 +3060,12 @@ class AssistantApp:
         self.document_now_pending_checkpoints.pop(checkpoint_id, None)
         snapshot = self.create_document_now_snapshot(checkpoint_id, status="snapshot_ready")
         self.run_document_now_snapshot(snapshot, trigger="no_active_recording")
+
+    def send_document_now_from_message_tab(self) -> None:
+        if self.document_now_current_snapshot:
+            self.regenerate_document_now_from_snapshot()
+            return
+        self.document_now_checkpoint()
 
     def handle_document_now_checkpoints(self, result) -> None:
         checkpoint_ids = list(getattr(result, "checkpoint_ids", None) or [])
@@ -5048,15 +5116,20 @@ class AssistantApp:
             "primary": self.current_prompt_id() if hasattr(self, "prompt_combo") else "",
             "secondary": self.current_secondary_prompt_id() if hasattr(self, "secondary_prompt_combo") else "",
             "tertiary": self.current_tertiary_prompt_id() if hasattr(self, "tertiary_prompt_combo") else "",
+            "document_now": self.current_document_now_prompt_id() if hasattr(self, "document_now_prompt_combo") else "",
         }
         self._refresh_prompt_combo(selected_id if target == "primary" else current_ids.get("primary") or None)
         self._refresh_secondary_prompt_combo(selected_id if target == "secondary" else current_ids.get("secondary") or None)
         self._refresh_tertiary_prompt_combo(selected_id if target == "tertiary" else current_ids.get("tertiary") or None)
+        self._refresh_document_now_prompt_combo(
+            selected_id if target == "document_now" else current_ids.get("document_now") or None
+        )
 
     def is_protected_common_prompt(self, prompt_id: str, *, title: str = "Prompt") -> bool:
         protected = {
             SECONDARY_ANALYSIS_PROMPT_ID: "Le prompt secondaire par défaut ne peut pas être supprimé.",
             TERTIARY_ANALYSIS_PROMPT_ID: "Le prompt tertiaire par défaut ne peut pas être supprimé.",
+            DOCUMENT_NOW_PROMPT_ID: "Le prompt Document maintenant par défaut ne peut pas être supprimé.",
         }
         message = protected.get(prompt_id)
         if not message:
@@ -5075,6 +5148,10 @@ class AssistantApp:
         if tertiary_config.get("default_prompt_id") == prompt_id:
             tertiary_config["default_prompt_id"] = TERTIARY_ANALYSIS_PROMPT_ID
             self.config["tertiary_analysis"] = tertiary_config
+            changed = True
+        document_now_config = self.config.setdefault("document_now", {})
+        if document_now_config.get("default_prompt_id") == prompt_id:
+            document_now_config["default_prompt_id"] = DOCUMENT_NOW_PROMPT_ID
             changed = True
         if changed:
             save_json(BASE_DIR / "config.json", self.config)
@@ -5381,10 +5458,10 @@ class AssistantApp:
         self.refresh_common_prompt_combos(target="tertiary", selected_id=prompt.id)
 
     def _refresh_document_now_prompt_combo(self, selected_id: str | None = None) -> None:
-        prompts = self.prompt_manager.list_prompts(prompt_type="document_now")
+        prompts = self.list_common_lmstudio_prompts()
         if not prompts:
             self.ensure_document_now_prompt()
-            prompts = self.prompt_manager.list_prompts(prompt_type="document_now")
+            prompts = self.list_common_lmstudio_prompts()
         self.document_now_prompt_name_to_id = {prompt.name: prompt.id for prompt in prompts}
         if hasattr(self, "document_now_prompt_combo"):
             self.document_now_prompt_combo["values"] = [prompt.name for prompt in prompts]
@@ -5393,8 +5470,10 @@ class AssistantApp:
         selected = self.prompt_manager.get(selected_id) if selected_id else None
         if selected is None:
             selected = self.prompt_manager.get(str(document_now_config.get("default_prompt_id") or ""))
-        if selected is None or selected.prompt_type != "document_now":
-            selected = self.prompt_manager.get_default("document_now")
+        if selected is None:
+            selected = self.prompt_manager.get(DOCUMENT_NOW_PROMPT_ID)
+        if selected is None or selected.prompt_type != "generic":
+            selected = self.prompt_manager.get_default("generic")
         if selected:
             self.document_now_prompt_var.set(selected.name)
             self.load_selected_document_now_prompt()
@@ -5421,7 +5500,7 @@ class AssistantApp:
             self.document_now_status_var.set("Document maintenant: aucun prompt")
             return
         default_id = str(self.config.setdefault("document_now", {}).get("default_prompt_id") or "")
-        marker = " par défaut" if prompt.id == default_id or prompt.is_default else ""
+        marker = " par défaut" if prompt.id == default_id else ""
         self.document_now_status_var.set(f"Document maintenant: {prompt.name}{marker}")
 
     def new_document_now_prompt(self) -> None:
@@ -5431,9 +5510,9 @@ class AssistantApp:
         prompt = self.prompt_manager.create(
             name,
             self.get_text(self.document_now_prompt_text),
-            prompt_type="document_now",
+            prompt_type="generic",
         )
-        self._refresh_document_now_prompt_combo(prompt.id)
+        self.refresh_common_prompt_combos(target="document_now", selected_id=prompt.id)
 
     def save_document_now_prompt(self) -> None:
         prompt_id = self.current_document_now_prompt_id()
@@ -5442,9 +5521,9 @@ class AssistantApp:
         prompt = self.prompt_manager.update(
             prompt_id,
             content=self.get_text(self.document_now_prompt_text),
-            prompt_type="document_now",
+            prompt_type="generic",
         )
-        self._refresh_document_now_prompt_combo(prompt.id)
+        self.refresh_common_prompt_combos(target="document_now", selected_id=prompt.id)
         self.document_now_status_var.set(f"Document maintenant: prompt enregistré ({prompt.name})")
 
     def duplicate_document_now_prompt(self) -> None:
@@ -5462,24 +5541,22 @@ class AssistantApp:
         prompt = self.prompt_manager.create(
             name or default_name,
             self.get_text(self.document_now_prompt_text),
-            prompt_type="document_now",
+            prompt_type="generic",
         )
-        self._refresh_document_now_prompt_combo(prompt.id)
+        self.refresh_common_prompt_combos(target="document_now", selected_id=prompt.id)
 
     def delete_document_now_prompt(self) -> None:
         prompt_id = self.current_document_now_prompt_id()
         if not prompt_id:
             return
+        if self.is_protected_common_prompt(prompt_id, title="Document maintenant"):
+            return
         if not messagebox.askyesno("Supprimer prompt Document maintenant", "Supprimer ce prompt ?", parent=self.root):
             return
         try:
             self.prompt_manager.delete(prompt_id)
-            document_now_config = self.config.setdefault("document_now", {})
-            if document_now_config.get("default_prompt_id") == prompt_id:
-                fallback = self.prompt_manager.get_default("document_now")
-                document_now_config["default_prompt_id"] = fallback.id if fallback else DOCUMENT_NOW_PROMPT_ID
-                save_json(BASE_DIR / "config.json", self.config)
-            self._refresh_document_now_prompt_combo()
+            self.reset_prompt_references_after_delete(prompt_id)
+            self.refresh_common_prompt_combos(target="document_now")
         except Exception as exc:
             messagebox.showerror("Document maintenant", str(exc), parent=self.root)
 
@@ -5490,13 +5567,12 @@ class AssistantApp:
         prompt = self.prompt_manager.get(prompt_id)
         if not prompt:
             return
-        self.prompt_manager.set_default(prompt.id)
         self.config.setdefault("document_now", {})["default_prompt_id"] = prompt.id
         try:
             save_json(BASE_DIR / "config.json", self.config)
         except Exception as exc:
             self.log_debug("warning", "app", "document_now_default_prompt_save_error", str(exc))
-        self._refresh_document_now_prompt_combo(prompt.id)
+        self.refresh_common_prompt_combos(target="document_now", selected_id=prompt.id)
 
     def _refresh_whisper_initial_prompt_combo(self, selected_id: str | None = None) -> None:
         prompts = self.whisper_initial_prompt_manager.list_prompts()
@@ -5743,6 +5819,7 @@ class AssistantApp:
             self.schedule_message_refresh()
             self.schedule_secondary_message_refresh()
             self.schedule_tertiary_message_refresh()
+            self.schedule_document_now_message_refresh()
             self.log_debug(
                 "info",
                 "app",
@@ -5772,6 +5849,7 @@ class AssistantApp:
         self.schedule_message_refresh()
         self.schedule_secondary_message_refresh()
         self.schedule_tertiary_message_refresh()
+        self.schedule_document_now_message_refresh()
         self.lmstudio_status_var.set("Fichiers retirés du message Gemma")
 
     def update_message_attachment_status(self) -> None:
@@ -5846,6 +5924,11 @@ class AssistantApp:
             "result_1": self.get_text(self.result_text).strip() if hasattr(self, "result_text") else "",
             "result_2": self.get_text(self.secondary_result_text).strip() if hasattr(self, "secondary_result_text") else "",
             "result_3": self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else "",
+            "document_now_result": (
+                self.get_text(self.document_now_result_text).strip()
+                if hasattr(self, "document_now_result_text")
+                else ""
+            ),
             "lmstudio_result": self.get_text(self.result_text).strip() if hasattr(self, "result_text") else "",
             "pdf_fields": "",
             "pdf_schema": "",
@@ -6500,10 +6583,15 @@ class AssistantApp:
         result_1 = self.get_text(self.result_text).strip()
         result_2 = self.get_text(self.secondary_result_text).strip()
         result_3 = self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else ""
+        document_now_result = (
+            self.get_text(self.document_now_result_text).strip() if hasattr(self, "document_now_result_text") else ""
+        )
         if source == "result_2":
             return result_2
         if source == "result_3":
             return result_3
+        if source == "document_now":
+            return document_now_result
         if source == "result_1_result_2":
             return "\n\n".join(part for part in (result_1, result_2) if part).strip()
         if source == "result_1_result_2_result_3":
@@ -6516,6 +6604,7 @@ class AssistantApp:
             label = {
                 "result_2": "Résultat 2",
                 "result_3": "Résultat 3",
+                "document_now": "Document maintenant",
                 "result_1_result_2": "résultat 1 + 2",
                 "result_1_result_2_result_3": "résultat 1 + 2 + 3",
             }.get(source, "résultat LM Studio")
@@ -6556,6 +6645,11 @@ class AssistantApp:
                 "result_1": self.get_text(self.result_text),
                 "result_2": self.get_text(self.secondary_result_text),
                 "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
+                "document_now_result": (
+                    self.get_text(self.document_now_result_text)
+                    if hasattr(self, "document_now_result_text")
+                    else ""
+                ),
                 "source": source,
                 "destination": request.destination,
                 "status": "weda_import_prepared",
@@ -6569,6 +6663,9 @@ class AssistantApp:
 
     def prepare_weda_import_result_3(self) -> None:
         self.prepare_weda_import(source="result_3")
+
+    def prepare_weda_import_document_now(self) -> None:
+        self.prepare_weda_import(source="document_now")
 
     def copy_result(self) -> None:
         ok = copy_text_to_clipboard(self.get_text(self.result_text), self.root)
@@ -6644,6 +6741,18 @@ class AssistantApp:
         if hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
         self.pdf_status_var.set("PDF: source Résultat 3 sélectionnée")
+
+    def use_document_now_result_for_pdf(self) -> None:
+        result = self.get_text(self.document_now_result_text).strip()
+        if not result:
+            messagebox.showwarning("PDF structuré", "Document maintenant est vide.", parent=self.root)
+            return
+        self.pdf_source_var.set("Document maintenant")
+        self.save_pdf_source_preference()
+        self.result_destination_var.set("PDF structuré")
+        if hasattr(self, "pdf_tab_frame"):
+            self.notebook.select(self.pdf_tab_frame)
+        self.pdf_status_var.set("PDF: source Document maintenant sélectionnée")
 
     def log_debug(
         self,
