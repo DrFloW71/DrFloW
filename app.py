@@ -9,7 +9,8 @@ import threading
 import time
 import tkinter as tk
 import uuid
-from datetime import date
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -122,6 +123,28 @@ CHAMPS PDF DISPONIBLES :
 
 SCHÉMA JSON ATTENDU :
 {{pdf_schema}}"""
+DOCUMENT_NOW_PROMPT_ID = "document_now_default"
+DOCUMENT_NOW_PROMPT_NAME = "Document maintenant"
+DOCUMENT_NOW_SPINNER_KEY = "document_now"
+DEFAULT_DOCUMENT_NOW_PROMPT = """Tu rédiges un document médical intermédiaire pendant une consultation en cours.
+
+Utilise uniquement le snapshot de transcription ci-dessous, créé au checkpoint {{checkpoint_id}}.
+Ce document intermédiaire ne doit pas conclure la consultation complète : la transcription principale continuera après ce snapshot.
+N’invente aucune information absente des sources.
+Rédige un document directement utilisable, clair, concis et structuré selon le besoin médical implicite.
+Si le snapshot est insuffisant, indique seulement les éléments disponibles et ce qui reste à préciser.
+
+DATE :
+{{date_today}}
+
+PATIENT :
+{{patient_details}}
+
+CONTEXTE WEDA :
+{{weda_context}}
+
+SNAPSHOT DE TRANSCRIPTION :
+{{snapshot_transcription}}"""
 PDF_SOURCE_CHOICES = (
     "Contexte + transcription",
     "Transcription seule",
@@ -295,6 +318,26 @@ def read_message_attachment_file(path: Path) -> dict:
     }
 
 
+@dataclass
+class DocumentNowSnapshot:
+    id: str
+    created_at: str
+    transcript_text: str
+    transcript_duration_seconds: float | None
+    transcript_segment_count: int | None
+    weda_context: str | None
+    patient_details: str | None
+    date_today: str
+    document_type: str | None
+    prompt_id: str | None
+    prompt_name: str | None
+    prompt_content: str | None
+    sent_message: str | None
+    result: str | None
+    status: str
+    error: str | None
+
+
 class AssistantApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -314,6 +357,7 @@ class AssistantApp:
         self.ensure_pdf_form_fill_prompt()
         self.ensure_secondary_analysis_prompt()
         self.ensure_tertiary_analysis_prompt()
+        self.ensure_document_now_prompt()
         self.whisper_initial_prompt_manager = PromptManager(BASE_DIR / "whisper_initial_prompts.json")
         self.ensure_whisper_initial_prompts()
         pdf_config = self.config.get("pdf", {})
@@ -335,6 +379,7 @@ class AssistantApp:
         self.prompt_name_to_id: dict[str, str] = {}
         self.secondary_prompt_name_to_id: dict[str, str] = {}
         self.tertiary_prompt_name_to_id: dict[str, str] = {}
+        self.document_now_prompt_name_to_id: dict[str, str] = {}
         self.pdf_prompt_name_to_id: dict[str, str] = {}
         self.pdf_template_name_to_id: dict[str, str] = {}
         self.whisper_initial_prompt_name_to_id: dict[str, str] = {}
@@ -342,12 +387,18 @@ class AssistantApp:
         self._message_refresh_job = None
         self._secondary_message_refresh_job = None
         self._tertiary_message_refresh_job = None
+        self._document_now_message_refresh_job = None
         self.message_attachments: list[dict] = []
         self._message_source_widgets = []
         self._secondary_message_source_widgets = []
         self._tertiary_message_source_widgets = []
+        self._document_now_message_source_widgets = []
         self.secondary_running = False
         self.tertiary_running = False
+        self.document_now_running = False
+        self.document_now_snapshots: dict[str, DocumentNowSnapshot] = {}
+        self.document_now_current_snapshot: DocumentNowSnapshot | None = None
+        self.document_now_pending_checkpoints: dict[str, dict] = {}
         self._connector_lock = threading.Lock()
         self.connector_job: dict | None = None
         self.dictation_run_id = 0
@@ -397,6 +448,7 @@ class AssistantApp:
         self.secondary_prompt_var = tk.StringVar(value="")
         self.tertiary_enabled_var = tk.BooleanVar(value=bool(tertiary_config.get("enabled")))
         self.tertiary_prompt_var = tk.StringVar(value="")
+        self.document_now_prompt_var = tk.StringVar(value="")
         self.whisper_initial_prompt_var = tk.StringVar(value="")
         self.include_prompt_var = tk.BooleanVar(value=bool(message_composition_config.get("include_prompt", True)))
         self.include_context_var = tk.BooleanVar(value=bool(message_composition_config.get("include_weda_context", True)))
@@ -442,6 +494,7 @@ class AssistantApp:
         self.prompt_status_var = tk.StringVar(value="Prompt: aucun")
         self.secondary_status_var = tk.StringVar(value="Prompt 2: désactivé")
         self.tertiary_status_var = tk.StringVar(value="Prompt 3: désactivé")
+        self.document_now_status_var = tk.StringVar(value="Document maintenant: prêt")
         self.whisper_initial_prompt_status_var = tk.StringVar(value="Prompt Whisper: aucun")
         self.abbreviations_status_var = tk.StringVar(value="Abréviations: non chargées")
         self.message_attachment_status_var = tk.StringVar(value="Fichiers: aucun")
@@ -466,6 +519,7 @@ class AssistantApp:
         self._refresh_prompt_combo()
         self._refresh_secondary_prompt_combo()
         self._refresh_tertiary_prompt_combo()
+        self._refresh_document_now_prompt_combo()
         self._refresh_pdf_prompt_combo()
         self.refresh_pdf_template_combo()
         self._refresh_whisper_initial_prompt_combo()
@@ -752,6 +806,14 @@ class AssistantApp:
         self.stop_dictation_button = ttk.Button(top, text="Arrêter dictée", command=self.stop_dictation, state=tk.DISABLED, style="Danger.TButton")
         self.stop_dictation_button.pack(side=tk.LEFT, padx=(0, 8))
 
+        self.document_now_button = ttk.Button(
+            top,
+            text="Document maintenant",
+            command=self.document_now_checkpoint,
+            style="Accent.TButton",
+        )
+        self.document_now_button.pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Label(top, text="Modèle").pack(side=tk.LEFT)
         ttk.Combobox(
             top,
@@ -960,6 +1022,23 @@ class AssistantApp:
                 ("Utiliser Résultat 3 pour PDF structuré", self.use_tertiary_result_for_pdf),
             ],
         )
+        self.document_now_notebook = self._add_series_group_tab("Document maintenant")
+        self.document_now_prompt_text = self._add_document_now_prompt_tab(parent_notebook=self.document_now_notebook)
+        self.document_now_sent_message_text = self._add_text_tab(
+            "Message envoyé",
+            parent_notebook=self.document_now_notebook,
+            buttons=[("Prévisualiser message", self.preview_document_now_message)],
+            readonly=True,
+        )
+        self.document_now_result_text = self._add_text_tab(
+            "Résultat",
+            parent_notebook=self.document_now_notebook,
+            buttons=[
+                ("Copier résultat", self.copy_document_now_result),
+                ("Regénérer depuis snapshot", self.regenerate_document_now_from_snapshot),
+                ("Effacer résultat", self.clear_document_now_result),
+            ],
+        )
         self.pdf_tab_frame = self._add_pdf_structured_tab()
         self.whisper_initial_prompt_text = self._add_whisper_initial_prompt_tab()
         self.abbreviations_text = self._add_abbreviations_tab()
@@ -996,6 +1075,11 @@ class AssistantApp:
             self.secondary_result_text,
             self.tertiary_prompt_text,
         ]
+        self._document_now_message_source_widgets = [
+            self.context_text,
+            self.transcription_text,
+            self.document_now_prompt_text,
+        ]
 
         status = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1010,6 +1094,7 @@ class AssistantApp:
             self.prompt_status_var,
             self.secondary_status_var,
             self.tertiary_status_var,
+            self.document_now_status_var,
             self.lmstudio_status_var,
             self.weda_patient_status_var,
             self.import_status_var,
@@ -1350,6 +1435,41 @@ class AssistantApp:
             ("Lancer Prompt 3 maintenant", self.run_tertiary_analysis_manual),
         ):
             ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
+
+        text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=scrollbar.set)
+        return text
+
+    def _add_document_now_prompt_tab(self, *, parent_notebook: ttk.Notebook | None = None) -> tk.Text:
+        notebook = parent_notebook or self.notebook
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Prompt")
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        self.document_now_prompt_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.document_now_prompt_var,
+            width=38,
+            state="readonly",
+        )
+        self.document_now_prompt_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.document_now_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_document_now_prompt())
+
+        for label, command in (
+            ("Nouveau", self.new_document_now_prompt),
+            ("Enregistrer", self.save_document_now_prompt),
+            ("Dupliquer", self.duplicate_document_now_prompt),
+            ("Supprimer", self.delete_document_now_prompt),
+            ("Défaut", self.set_default_document_now_prompt),
+            ("Prévisualiser message", self.preview_document_now_message),
+            ("Document maintenant", self.document_now_checkpoint),
+        ):
+            ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
+        self.register_lmstudio_spinner(toolbar, DOCUMENT_NOW_SPINNER_KEY)
 
         text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1715,6 +1835,32 @@ class AssistantApp:
         selected = self.prompt_manager.get(default_prompt_id)
         if selected is None or selected.prompt_type != "generic":
             tertiary_config["default_prompt_id"] = prompt.id
+            try:
+                save_json(BASE_DIR / "config.json", self.config)
+            except Exception:
+                pass
+
+    def ensure_document_now_prompt(self) -> None:
+        document_now_config = self.config.setdefault("document_now", {})
+        prompt = self.prompt_manager.get(DOCUMENT_NOW_PROMPT_ID) or self.prompt_manager.get_by_name(DOCUMENT_NOW_PROMPT_NAME)
+        if prompt is None:
+            prompt = self.prompt_manager.create(
+                DOCUMENT_NOW_PROMPT_NAME,
+                DEFAULT_DOCUMENT_NOW_PROMPT,
+                is_default=True,
+                prompt_type="document_now",
+                prompt_id=DOCUMENT_NOW_PROMPT_ID,
+            )
+        elif prompt.prompt_type != "document_now":
+            prompt = self.prompt_manager.update(prompt.id, prompt_type="document_now")
+
+        default_prompt_id = str(document_now_config.get("default_prompt_id") or "")
+        selected = self.prompt_manager.get(default_prompt_id)
+        changed = False
+        if selected is None or selected.prompt_type != "document_now":
+            document_now_config["default_prompt_id"] = prompt.id
+            changed = True
+        if changed:
             try:
                 save_json(BASE_DIR / "config.json", self.config)
             except Exception:
@@ -2368,6 +2514,12 @@ class AssistantApp:
                 widget.edit_modified(False)
             except Exception:
                 pass
+        for widget in self._document_now_message_source_widgets:
+            widget.bind("<<Modified>>", self.on_document_now_message_source_modified, add="+")
+            try:
+                widget.edit_modified(False)
+            except Exception:
+                pass
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_message_refresh())
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_secondary_message_refresh())
         self.include_prompt_var.trace_add("write", lambda *_args: self.schedule_tertiary_message_refresh())
@@ -2383,6 +2535,7 @@ class AssistantApp:
         self.schedule_message_refresh()
         self.schedule_secondary_message_refresh()
         self.schedule_tertiary_message_refresh()
+        self.schedule_document_now_message_refresh()
 
     def on_message_source_modified(self, event) -> None:
         widget = event.widget
@@ -2408,6 +2561,13 @@ class AssistantApp:
         except Exception:
             pass
         self.schedule_tertiary_message_refresh()
+
+    def on_document_now_message_source_modified(self, event) -> None:
+        try:
+            event.widget.edit_modified(False)
+        except Exception:
+            pass
+        self.schedule_document_now_message_refresh()
 
     def schedule_message_refresh(self, delay_ms: int = 60) -> None:
         if not hasattr(self, "sent_message_text"):
@@ -2438,6 +2598,16 @@ class AssistantApp:
             except Exception:
                 pass
         self._tertiary_message_refresh_job = self.root.after(delay_ms, self.refresh_tertiary_sent_message)
+
+    def schedule_document_now_message_refresh(self, delay_ms: int = 120) -> None:
+        if not hasattr(self, "document_now_sent_message_text"):
+            return
+        if self._document_now_message_refresh_job:
+            try:
+                self.root.after_cancel(self._document_now_message_refresh_job)
+            except Exception:
+                pass
+        self._document_now_message_refresh_job = self.root.after(delay_ms, self.refresh_document_now_sent_message)
 
     def save_message_composition_settings(self) -> None:
         message_config = self.config.setdefault("message_composition", {})
@@ -2631,6 +2801,396 @@ class AssistantApp:
                 "weda_context": self.get_text(self.context_text),
             }
         )
+
+    def build_document_now_patient_details(self) -> str:
+        context = self.context_manager.get_latest()
+        if not context:
+            return ""
+        lines = [
+            context.patient_identity,
+            f"Âge : {context.patient_age}" if context.patient_age else "",
+            f"Sexe : {context.patient_sex}" if context.patient_sex else "",
+        ]
+        return "\n".join(line for line in lines if line).strip()
+
+    def create_document_now_snapshot(
+        self,
+        checkpoint_id: str,
+        result=None,
+        *,
+        status: str = "snapshot_ready",
+    ) -> DocumentNowSnapshot:
+        prompt_id = self.current_document_now_prompt_id()
+        prompt = self.prompt_manager.get(prompt_id) if prompt_id else None
+        prompt_content = self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
+            prompt.content if prompt else DEFAULT_DOCUMENT_NOW_PROMPT
+        )
+        audio_stats = getattr(result, "audio_stats", {}) or {}
+        duration_seconds = audio_stats.get("duration_seconds")
+        try:
+            transcript_duration_seconds = float(duration_seconds) if duration_seconds not in (None, "") else None
+        except (TypeError, ValueError):
+            transcript_duration_seconds = None
+
+        segment_index = getattr(result, "segment_index", None)
+        try:
+            transcript_segment_count = int(segment_index) if segment_index is not None else None
+        except (TypeError, ValueError):
+            transcript_segment_count = None
+
+        return DocumentNowSnapshot(
+            id=checkpoint_id,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            transcript_text=self.get_clean_transcription_text(),
+            transcript_duration_seconds=transcript_duration_seconds,
+            transcript_segment_count=transcript_segment_count,
+            weda_context=self.get_text(self.context_text).strip() or None,
+            patient_details=self.build_document_now_patient_details() or None,
+            date_today=date.today().strftime("%d/%m/%Y"),
+            document_type="document_intermediaire",
+            prompt_id=prompt.id if prompt else prompt_id or None,
+            prompt_name=prompt.name if prompt else self.document_now_prompt_var.get() or None,
+            prompt_content=prompt_content,
+            sent_message=None,
+            result=None,
+            status=status,
+            error=None,
+        )
+
+    def build_document_now_prompt_variables(self, snapshot: DocumentNowSnapshot) -> dict[str, str]:
+        variables = self.build_prompt_variables()
+        patient_details = snapshot.patient_details or ""
+        variables.update(
+            {
+                "transcription": snapshot.transcript_text or "",
+                "snapshot_transcription": snapshot.transcript_text or "",
+                "snapshot_de_transcription": snapshot.transcript_text or "",
+                "weda_context": snapshot.weda_context or "",
+                "patient_details": patient_details,
+                "patient_identity": patient_details or variables.get("patient_identity", ""),
+                "current_date": snapshot.date_today,
+                "date_today": snapshot.date_today,
+                "checkpoint_id": snapshot.id,
+                "snapshot_id": snapshot.id,
+                "document_type": snapshot.document_type or "document_intermediaire",
+                "document_label": "Document maintenant",
+                "prompt_name": snapshot.prompt_name or "",
+                "transcript_segment_count": "" if snapshot.transcript_segment_count is None else str(snapshot.transcript_segment_count),
+                "transcript_duration_seconds": (
+                    "" if snapshot.transcript_duration_seconds is None else f"{snapshot.transcript_duration_seconds:.1f}"
+                ),
+                "snapshot_created_at": snapshot.created_at,
+            }
+        )
+        return variables
+
+    def append_missing_document_now_sections(
+        self,
+        prompt_content: str,
+        message: str,
+        variables: dict[str, str],
+    ) -> str:
+        sections = []
+        if not (
+            self.prompt_contains_variable(prompt_content, "date_today")
+            or self.prompt_contains_variable(prompt_content, "current_date")
+        ):
+            sections.append(("DATE", variables.get("date_today", "")))
+
+        if not (
+            self.prompt_contains_variable(prompt_content, "patient_details")
+            or self.prompt_contains_variable(prompt_content, "patient_identity")
+        ):
+            sections.append(("PATIENT", variables.get("patient_details", "")))
+
+        if not self.prompt_contains_variable(prompt_content, "weda_context"):
+            sections.append(("CONTEXTE WEDA", variables.get("weda_context", "")))
+
+        if not (
+            self.prompt_contains_variable(prompt_content, "snapshot_transcription")
+            or self.prompt_contains_variable(prompt_content, "snapshot_de_transcription")
+            or self.prompt_contains_variable(prompt_content, "transcription")
+        ):
+            sections.append(("SNAPSHOT DE TRANSCRIPTION", variables.get("snapshot_transcription", "")))
+
+        source_block = "\n\n".join(f"{title} :\n{content}" for title, content in sections if content)
+        if not source_block:
+            return message.strip()
+
+        header = "DONNÉES DU DOCUMENT INTERMÉDIAIRE (snapshot de transcription figé)"
+        if not message.strip():
+            return f"{header}\n\n{source_block}".strip()
+        return f"{message.rstrip()}\n\n---\n{header}\n\n{source_block}".strip()
+
+    def build_document_now_lmstudio_message(
+        self,
+        snapshot: DocumentNowSnapshot | None = None,
+    ) -> tuple[str, dict[str, str], DocumentNowSnapshot]:
+        snapshot = snapshot or self.document_now_current_snapshot or self.create_document_now_snapshot(
+            f"preview-{uuid.uuid4().hex[:8]}",
+            status="preview",
+        )
+        prompt_content = self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
+            snapshot.prompt_content or DEFAULT_DOCUMENT_NOW_PROMPT
+        )
+        prompt_id = self.current_document_now_prompt_id()
+        prompt = self.prompt_manager.get(prompt_id) if prompt_id else None
+        snapshot.prompt_id = prompt.id if prompt else prompt_id or snapshot.prompt_id
+        snapshot.prompt_name = prompt.name if prompt else self.document_now_prompt_var.get() or snapshot.prompt_name
+        snapshot.prompt_content = prompt_content
+        variables = self.build_document_now_prompt_variables(snapshot)
+        message = self.prompt_manager.render_prompt(prompt_content, variables) if prompt_content.strip() else ""
+        message = self.append_missing_document_now_sections(prompt_content, message, variables)
+        return message, variables, snapshot
+
+    def refresh_document_now_sent_message(self) -> str:
+        self._document_now_message_refresh_job = None
+        try:
+            message, _variables, _snapshot = self.build_document_now_lmstudio_message()
+        except Exception as exc:
+            message = f"[Message Document maintenant non disponible] {exc}"
+        self.set_text(self.document_now_sent_message_text, message, readonly=True)
+        return message
+
+    def preview_document_now_message(self) -> str:
+        message = self.refresh_document_now_sent_message()
+        self.select_tab_containing_widget(self.document_now_sent_message_text)
+        self.log_debug(
+            "info",
+            "app",
+            "document_now_message_previewed",
+            "Message Document maintenant prévisualisé.",
+            {
+                "prompt_name": self.document_now_prompt_var.get(),
+                "message_length": len(message),
+                "has_snapshot": bool(self.document_now_current_snapshot),
+            },
+        )
+        return message
+
+    def document_now_checkpoint(self) -> None:
+        if self.document_now_running:
+            self.document_now_status_var.set("Document maintenant: génération déjà en cours")
+            return
+        if self.document_now_pending_checkpoints:
+            self.document_now_status_var.set("Document maintenant: checkpoint déjà en attente de transcription")
+            return
+
+        checkpoint_id = f"checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self.document_now_pending_checkpoints[checkpoint_id] = {"created_at": time.time()}
+        self.document_now_status_var.set("Document maintenant: checkpoint demandé, flush du segment audio")
+        self.log_debug(
+            "info",
+            "app",
+            "document_now_checkpoint_requested",
+            "Checkpoint Document maintenant demandé.",
+            {
+                "checkpoint_id": checkpoint_id,
+                "session_running": bool(self.session and self.session.is_running()),
+                "transcription_length": len(self.get_clean_transcription_text()),
+            },
+        )
+
+        if self.session and self.session.is_running() and self.session.request_checkpoint(checkpoint_id):
+            self.transcription_status_var.set("Checkpoint Document maintenant: segment en transcription")
+            return
+
+        self.document_now_pending_checkpoints.pop(checkpoint_id, None)
+        snapshot = self.create_document_now_snapshot(checkpoint_id, status="snapshot_ready")
+        self.run_document_now_snapshot(snapshot, trigger="no_active_recording")
+
+    def handle_document_now_checkpoints(self, result) -> None:
+        checkpoint_ids = list(getattr(result, "checkpoint_ids", None) or [])
+        if not checkpoint_ids:
+            return
+        for checkpoint_id in checkpoint_ids:
+            self.document_now_pending_checkpoints.pop(checkpoint_id, None)
+            snapshot = self.create_document_now_snapshot(checkpoint_id, result, status="snapshot_ready")
+            self.run_document_now_snapshot(snapshot, trigger="checkpoint_flush")
+
+    def run_document_now_snapshot(self, snapshot: DocumentNowSnapshot, *, trigger: str = "manual") -> None:
+        if self.document_now_running:
+            self.document_now_status_var.set("Document maintenant: génération déjà en cours")
+            return
+        try:
+            message, variables, snapshot = self.build_document_now_lmstudio_message(snapshot)
+        except Exception as exc:
+            snapshot.status = "error"
+            snapshot.error = str(exc)
+            self.document_now_current_snapshot = snapshot
+            self.document_now_snapshots[snapshot.id] = snapshot
+            self.document_now_status_var.set("Document maintenant: message impossible")
+            messagebox.showerror("Document maintenant", str(exc), parent=self.root)
+            return
+
+        message = message.strip()
+        if not message:
+            snapshot.status = "error"
+            snapshot.error = "message LM Studio vide"
+            self.document_now_current_snapshot = snapshot
+            self.document_now_snapshots[snapshot.id] = snapshot
+            self.document_now_status_var.set("Document maintenant: message vide")
+            messagebox.showwarning(
+                "Document maintenant",
+                "Le message à envoyer est vide. Ajoute un prompt, une transcription ou un contexte.",
+                parent=self.root,
+            )
+            return
+
+        snapshot.sent_message = message
+        snapshot.status = "generating"
+        snapshot.error = None
+        self.document_now_current_snapshot = snapshot
+        self.document_now_snapshots[snapshot.id] = snapshot
+        self.set_text(self.document_now_sent_message_text, message, readonly=True)
+        self.set_text(self.document_now_result_text, "")
+        self.document_now_running = True
+        self.configure_document_now_button_state()
+        self.document_now_status_var.set("Document maintenant: génération du document intermédiaire")
+        self.lmstudio_status_var.set("LM Studio: Document maintenant en cours")
+        self.start_lmstudio_spinner(DOCUMENT_NOW_SPINNER_KEY)
+        self.select_tab_containing_widget(self.document_now_sent_message_text)
+        lm_config = self.config.get("lmstudio", {})
+        client = self.build_lmstudio_client()
+        self.log_debug(
+            "info",
+            "app",
+            "document_now_lmstudio_request_started",
+            "Génération Document maintenant lancée.",
+            {
+                "checkpoint_id": snapshot.id,
+                "trigger": trigger,
+                "prompt_name": variables.get("prompt_name", ""),
+                "url": str(lm_config.get("url") or "http://localhost:1234/v1/chat/completions"),
+                "model": str(lm_config.get("model") or "local-model"),
+                "message_length": len(message),
+                "snapshot_transcription_length": len(snapshot.transcript_text or ""),
+                "weda_context_length": len(snapshot.weda_context or ""),
+            },
+        )
+
+        def worker():
+            try:
+                response = client.chat(message)
+                self.root.after(0, self.on_document_now_response, snapshot.id, response, message)
+            except Exception as exc:
+                self.root.after(0, self.on_document_now_error, snapshot.id, exc, message)
+
+        threading.Thread(target=worker, name="lmstudio-document-now-request", daemon=True).start()
+
+    def configure_document_now_button_state(self) -> None:
+        if hasattr(self, "document_now_button"):
+            self.document_now_button.configure(state=tk.DISABLED if self.document_now_running else tk.NORMAL)
+
+    def on_document_now_response(self, snapshot_id: str, response, sent_message: str) -> None:
+        self.stop_lmstudio_spinner(DOCUMENT_NOW_SPINNER_KEY)
+        snapshot = self.document_now_snapshots.get(snapshot_id) or self.document_now_current_snapshot
+        result_text = self.apply_abbreviations_to_lmstudio_result(response.text, "Document maintenant")
+        if snapshot:
+            snapshot.result = result_text
+            snapshot.sent_message = sent_message
+            snapshot.status = "done"
+            snapshot.error = None
+            self.document_now_snapshots[snapshot.id] = snapshot
+            self.document_now_current_snapshot = snapshot
+        self.document_now_running = False
+        self.configure_document_now_button_state()
+        self.set_text(self.document_now_result_text, result_text)
+        self.select_tab_containing_widget(self.document_now_result_text)
+        self.document_now_status_var.set(f"Document maintenant: reçu en {response.elapsed_seconds:.1f}s")
+        self.lmstudio_status_var.set(f"LM Studio: Document maintenant reçu en {response.elapsed_seconds:.1f}s")
+        self.log_debug(
+            "info",
+            "app",
+            "document_now_lmstudio_response",
+            "Document intermédiaire reçu.",
+            {
+                "checkpoint_id": snapshot_id,
+                "elapsed_seconds": response.elapsed_seconds,
+                "raw_result_length": len(response.text or ""),
+                "result_length": len(result_text or ""),
+            },
+        )
+        if snapshot:
+            self.append_document_now_history(snapshot, sent_message, result_text)
+
+    def on_document_now_error(self, snapshot_id: str, error: Exception, sent_message: str) -> None:
+        self.stop_lmstudio_spinner(DOCUMENT_NOW_SPINNER_KEY)
+        snapshot = self.document_now_snapshots.get(snapshot_id) or self.document_now_current_snapshot
+        message = f"Erreur Document maintenant : {error}"
+        if snapshot:
+            snapshot.sent_message = sent_message
+            snapshot.status = "error"
+            snapshot.error = str(error)
+            self.document_now_snapshots[snapshot.id] = snapshot
+            self.document_now_current_snapshot = snapshot
+        self.document_now_running = False
+        self.configure_document_now_button_state()
+        self.set_text(self.document_now_result_text, message)
+        self.select_tab_containing_widget(self.document_now_result_text)
+        self.document_now_status_var.set("Document maintenant: erreur")
+        self.lmstudio_status_var.set("LM Studio: erreur Document maintenant")
+        self.log_debug(
+            "error",
+            "app",
+            "document_now_lmstudio_error",
+            str(error),
+            {
+                "checkpoint_id": snapshot_id,
+                "message_length": len(sent_message or ""),
+            },
+        )
+        messagebox.showerror("Document maintenant", str(error), parent=self.root)
+
+    def append_document_now_history(
+        self,
+        snapshot: DocumentNowSnapshot,
+        sent_message: str,
+        result_text: str,
+    ) -> None:
+        self.history_manager.append(
+            {
+                **self.current_stt_history_payload(),
+                "status": "document_now_response",
+                "document_label": "Document maintenant",
+                "document_type": snapshot.document_type,
+                "document_now_snapshot": asdict(snapshot),
+                "checkpoint_id": snapshot.id,
+                "snapshot_created_at": snapshot.created_at,
+                "prompt_id": snapshot.prompt_id or "",
+                "prompt_name": snapshot.prompt_name or self.document_now_prompt_var.get(),
+                "transcription": self.get_clean_transcription_text(),
+                "snapshot_transcription": snapshot.transcript_text,
+                "weda_context": snapshot.weda_context or "",
+                "sent_message": sent_message,
+                "lmstudio_result": result_text,
+            }
+        )
+
+    def regenerate_document_now_from_snapshot(self) -> None:
+        snapshot = self.document_now_current_snapshot
+        if not snapshot:
+            messagebox.showinfo(
+                "Document maintenant",
+                "Aucun snapshot de transcription n’est disponible pour régénérer.",
+                parent=self.root,
+            )
+            return
+        snapshot.result = None
+        snapshot.status = "snapshot_ready"
+        snapshot.error = None
+        self.run_document_now_snapshot(snapshot, trigger="regenerate_same_snapshot")
+
+    def copy_document_now_result(self) -> None:
+        ok = copy_text_to_clipboard(self.get_text(self.document_now_result_text), self.root)
+        self.document_now_status_var.set("Document maintenant: résultat copié" if ok else "Document maintenant: copie impossible")
+
+    def clear_document_now_result(self) -> None:
+        self.set_text(self.document_now_result_text, "")
+        if self.document_now_current_snapshot:
+            self.document_now_current_snapshot.result = None
+            self.document_now_current_snapshot.status = "cleared"
+        self.document_now_status_var.set("Document maintenant: résultat effacé")
 
     def build_secondary_lmstudio_message(self) -> tuple[str, dict[str, str]]:
         result_1 = self.get_text(self.result_text).strip()
@@ -4195,15 +4755,24 @@ class AssistantApp:
         self.set_text(self.secondary_sent_message_text, "", readonly=True)
         self.set_text(self.tertiary_result_text, "")
         self.set_text(self.tertiary_sent_message_text, "", readonly=True)
+        self.set_text(self.document_now_result_text, "")
+        self.set_text(self.document_now_sent_message_text, "", readonly=True)
+        self.document_now_snapshots.clear()
+        self.document_now_current_snapshot = None
+        self.document_now_pending_checkpoints.clear()
+        self.document_now_running = False
+        self.configure_document_now_button_state()
         self.weda_patient_status_var.set("Patient WEDA: non reçu")
         self.transcription_status_var.set("Transcription prête")
         self.lmstudio_status_var.set("LM Studio: prêt")
         self.update_secondary_status()
         self.update_tertiary_status()
+        self.update_document_now_status()
         self.import_status_var.set("Import WEDA: aucun")
         self.schedule_message_refresh()
         self.schedule_secondary_message_refresh()
         self.schedule_tertiary_message_refresh()
+        self.schedule_document_now_message_refresh()
         self.log_debug("info", "app", "dictation_session_reset", "Données de session dictée effacées.")
 
     def set_connector_job(self, updates: dict, *, replace: bool = False) -> dict:
@@ -4415,8 +4984,10 @@ class AssistantApp:
                 "stt_warnings": getattr(result, "stt_warnings", []),
                 "stt_errors": getattr(result, "stt_errors", []),
                 "audio_stats": getattr(result, "audio_stats", {}),
+                "checkpoint_ids": getattr(result, "checkpoint_ids", []),
             },
         )
+        self.handle_document_now_checkpoints(result)
 
     def append_transcription_line(self, text: str, *, diagnostic: bool = False) -> None:
         text = clean_transcription_text(str(text or ""), self.config.get("transcription_cleaning", {}))
@@ -4459,6 +5030,9 @@ class AssistantApp:
     def on_session_error(self, error: Exception, run_id: int) -> None:
         if run_id != self.dictation_run_id:
             return
+        if self.document_now_pending_checkpoints:
+            self.document_now_pending_checkpoints.clear()
+            self.document_now_status_var.set("Document maintenant: checkpoint annulé après erreur STT")
         self.set_dictation_buttons_running(False)
         self.set_recording_indicator(False)
         self.micro_status_var.set("Micro: erreur")
@@ -4805,6 +5379,124 @@ class AssistantApp:
         except Exception as exc:
             self.log_debug("error", "app", "tertiary_default_prompt_save_error", str(exc))
         self.refresh_common_prompt_combos(target="tertiary", selected_id=prompt.id)
+
+    def _refresh_document_now_prompt_combo(self, selected_id: str | None = None) -> None:
+        prompts = self.prompt_manager.list_prompts(prompt_type="document_now")
+        if not prompts:
+            self.ensure_document_now_prompt()
+            prompts = self.prompt_manager.list_prompts(prompt_type="document_now")
+        self.document_now_prompt_name_to_id = {prompt.name: prompt.id for prompt in prompts}
+        if hasattr(self, "document_now_prompt_combo"):
+            self.document_now_prompt_combo["values"] = [prompt.name for prompt in prompts]
+
+        document_now_config = self.config.setdefault("document_now", {})
+        selected = self.prompt_manager.get(selected_id) if selected_id else None
+        if selected is None:
+            selected = self.prompt_manager.get(str(document_now_config.get("default_prompt_id") or ""))
+        if selected is None or selected.prompt_type != "document_now":
+            selected = self.prompt_manager.get_default("document_now")
+        if selected:
+            self.document_now_prompt_var.set(selected.name)
+            self.load_selected_document_now_prompt()
+        self.update_document_now_status()
+
+    def current_document_now_prompt_id(self) -> str:
+        return self.document_now_prompt_name_to_id.get(self.document_now_prompt_var.get(), "")
+
+    def load_selected_document_now_prompt(self) -> None:
+        prompt = self.prompt_manager.get(self.current_document_now_prompt_id())
+        if not prompt:
+            return
+        self.set_text(self.document_now_prompt_text, prompt.content)
+        self.update_document_now_status(prompt=prompt)
+        self.schedule_document_now_message_refresh()
+
+    def update_document_now_status(self, prompt=None) -> None:
+        if prompt is None:
+            prompt = self.prompt_manager.get(self.current_document_now_prompt_id())
+        if self.document_now_running:
+            self.document_now_status_var.set("Document maintenant: génération en cours")
+            return
+        if not prompt:
+            self.document_now_status_var.set("Document maintenant: aucun prompt")
+            return
+        default_id = str(self.config.setdefault("document_now", {}).get("default_prompt_id") or "")
+        marker = " par défaut" if prompt.id == default_id or prompt.is_default else ""
+        self.document_now_status_var.set(f"Document maintenant: {prompt.name}{marker}")
+
+    def new_document_now_prompt(self) -> None:
+        name = simpledialog.askstring("Nouveau prompt Document maintenant", "Nom du prompt :", parent=self.root)
+        if not name:
+            return
+        prompt = self.prompt_manager.create(
+            name,
+            self.get_text(self.document_now_prompt_text),
+            prompt_type="document_now",
+        )
+        self._refresh_document_now_prompt_combo(prompt.id)
+
+    def save_document_now_prompt(self) -> None:
+        prompt_id = self.current_document_now_prompt_id()
+        if not prompt_id:
+            return
+        prompt = self.prompt_manager.update(
+            prompt_id,
+            content=self.get_text(self.document_now_prompt_text),
+            prompt_type="document_now",
+        )
+        self._refresh_document_now_prompt_combo(prompt.id)
+        self.document_now_status_var.set(f"Document maintenant: prompt enregistré ({prompt.name})")
+
+    def duplicate_document_now_prompt(self) -> None:
+        prompt_id = self.current_document_now_prompt_id()
+        if not prompt_id:
+            return
+        source = self.prompt_manager.get(prompt_id)
+        default_name = f"{source.name} - copie" if source else "Document maintenant - copie"
+        name = simpledialog.askstring(
+            "Dupliquer prompt Document maintenant",
+            "Nom de la copie :",
+            initialvalue=default_name,
+            parent=self.root,
+        )
+        prompt = self.prompt_manager.create(
+            name or default_name,
+            self.get_text(self.document_now_prompt_text),
+            prompt_type="document_now",
+        )
+        self._refresh_document_now_prompt_combo(prompt.id)
+
+    def delete_document_now_prompt(self) -> None:
+        prompt_id = self.current_document_now_prompt_id()
+        if not prompt_id:
+            return
+        if not messagebox.askyesno("Supprimer prompt Document maintenant", "Supprimer ce prompt ?", parent=self.root):
+            return
+        try:
+            self.prompt_manager.delete(prompt_id)
+            document_now_config = self.config.setdefault("document_now", {})
+            if document_now_config.get("default_prompt_id") == prompt_id:
+                fallback = self.prompt_manager.get_default("document_now")
+                document_now_config["default_prompt_id"] = fallback.id if fallback else DOCUMENT_NOW_PROMPT_ID
+                save_json(BASE_DIR / "config.json", self.config)
+            self._refresh_document_now_prompt_combo()
+        except Exception as exc:
+            messagebox.showerror("Document maintenant", str(exc), parent=self.root)
+
+    def set_default_document_now_prompt(self) -> None:
+        prompt_id = self.current_document_now_prompt_id()
+        if not prompt_id:
+            return
+        prompt = self.prompt_manager.get(prompt_id)
+        if not prompt:
+            return
+        self.prompt_manager.set_default(prompt.id)
+        self.config.setdefault("document_now", {})["default_prompt_id"] = prompt.id
+        try:
+            save_json(BASE_DIR / "config.json", self.config)
+        except Exception as exc:
+            self.log_debug("warning", "app", "document_now_default_prompt_save_error", str(exc))
+        self._refresh_document_now_prompt_combo(prompt.id)
 
     def _refresh_whisper_initial_prompt_combo(self, selected_id: str | None = None) -> None:
         prompts = self.whisper_initial_prompt_manager.list_prompts()
@@ -6007,6 +6699,8 @@ class AssistantApp:
             self.schedule_secondary_message_refresh()
         if hasattr(self, "_tertiary_message_source_widgets") and widget in self._tertiary_message_source_widgets:
             self.schedule_tertiary_message_refresh()
+        if hasattr(self, "_document_now_message_source_widgets") and widget in self._document_now_message_source_widgets:
+            self.schedule_document_now_message_refresh()
 
     def get_clean_transcription_text(self) -> str:
         return clean_transcription_text(self.get_text(self.transcription_text), self.config.get("transcription_cleaning", {}))

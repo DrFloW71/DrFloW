@@ -31,6 +31,8 @@ class SegmentedDictationSession:
         self._record_thread: threading.Thread | None = None
         self._transcribe_thread: threading.Thread | None = None
         self._recorder: AudioRecorder | None = None
+        self._checkpoint_lock = threading.Lock()
+        self._pending_checkpoint_ids: list[str] = []
         self._temp_dir = Path(tempfile.mkdtemp(prefix="gemma_weda_audio_"))
 
     def start(self) -> None:
@@ -54,6 +56,21 @@ class SegmentedDictationSession:
     def is_running(self) -> bool:
         return bool(self._record_thread and self._record_thread.is_alive())
 
+    def request_checkpoint(self, checkpoint_id: str) -> bool:
+        if not self.is_running():
+            return False
+        with self._checkpoint_lock:
+            self._pending_checkpoint_ids.append(str(checkpoint_id))
+        if self._recorder:
+            self._recorder.stop()
+        return True
+
+    def _pop_pending_checkpoint_ids(self) -> list[str]:
+        with self._checkpoint_lock:
+            checkpoint_ids = list(self._pending_checkpoint_ids)
+            self._pending_checkpoint_ids.clear()
+        return checkpoint_ids
+
     def _record_loop(self) -> None:
         try:
             settings = self.settings_provider()
@@ -74,11 +91,12 @@ class SegmentedDictationSession:
                 if self._stop_event.is_set() and audio is None:
                     break
 
+                checkpoint_ids = self._pop_pending_checkpoint_ids()
                 combined = self._recorder.concat(previous_tail, audio)
                 previous_tail = self._recorder.tail(audio, overlap_seconds)
                 path = self._temp_dir / f"segment_{index:04d}.wav"
                 self._recorder.write_wav(path, combined)
-                self._queue.put((index, path, auto_delete_audio))
+                self._queue.put((index, path, auto_delete_audio, checkpoint_ids))
 
             self.on_status("Dictée arrêtée")
         except Exception as exc:
@@ -92,10 +110,15 @@ class SegmentedDictationSession:
             if item is None:
                 return
 
-            index, path, auto_delete_audio = item
+            if len(item) == 3:
+                index, path, auto_delete_audio = item
+                checkpoint_ids = []
+            else:
+                index, path, auto_delete_audio, checkpoint_ids = item
             try:
                 self.on_status(f"Segment {index} en transcription")
                 result = self.transcriber.transcribe_file(path, segment_index=index)
+                result.checkpoint_ids = checkpoint_ids
                 self.on_transcription(result)
             except Exception as exc:
                 self.on_error(exc)

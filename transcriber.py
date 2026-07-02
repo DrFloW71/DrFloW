@@ -35,6 +35,7 @@ class TranscriptionResult:
     stt_mode: str = "segments"
     stt_warnings: list | None = None
     stt_errors: list | None = None
+    checkpoint_ids: list[str] | None = None
 
 
 class Transcriber:

@@ -122,7 +122,7 @@
   },
   "message_composition": {
     "include_prompt": true,
-    "include_weda_context": false,
+    "include_weda_context": true,
     "include_transcription": true
   },
   "server": {
@@ -169,6 +169,9 @@
     "include_result_2": true,
     "show_sent_message_3": true,
     "allow_manual_run": true
+  },
+  "document_now": {
+    "default_prompt_id": "document_now_default"
   },
   "abbreviations": {
     "include_in_lmstudio_prompt": true

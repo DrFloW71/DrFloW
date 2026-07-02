@@ -9,13 +9,16 @@ from typing import Mapping
 
 
 VARIABLE_RE = re.compile(r"{{\s*([a-zA-Z0-9_]+)\s*}}")
-VALID_PROMPT_TYPES = {"pdf_form_fill", "generic"}
+VALID_PROMPT_TYPES = {"pdf_form_fill", "generic", "document_now"}
 LEGACY_PROMPT_TYPE_ALIASES = {
     "": "generic",
     "general": "generic",
     "primary": "generic",
     "secondary": "generic",
     "tertiary": "generic",
+    "document-now": "document_now",
+    "document now": "document_now",
+    "document_maintenant": "document_now",
 }
 
 
