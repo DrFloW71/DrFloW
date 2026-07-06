@@ -204,6 +204,7 @@ class FasterWhisperBackend(STTBackend):
             "vad_filter": vad_filter,
             "condition_on_previous_text": condition_on_previous_text,
             "initial_prompt": initial_prompt,
+            "without_timestamps": bool_setting(settings_map.get("without_timestamps"), False),
             "temperature": float(settings_map.get("temperature") if settings_map.get("temperature") is not None else 0.0),
             "no_speech_threshold": float(settings_map.get("no_speech_threshold") or 0.6),
             "log_prob_threshold": float(settings_map.get("log_prob_threshold") if settings_map.get("log_prob_threshold") is not None else -1.0),

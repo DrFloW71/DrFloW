@@ -164,9 +164,22 @@ WHISPER_MODEL_CHOICES = (
     "large-v3-turbo",
     "turbo",
 )
+WHISPER_DEVICE_CHOICES = ("cpu", "cuda")
+WHISPER_COMPUTE_CHOICES = ("int8", "int8_float16", "float16", "float32")
 DEFAULT_FLY_WHISPER_INITIAL_PROMPT = (
     "Dictée médicale courte en français. Respecter les termes médicaux, médicaments, posologies, "
     "unités et abréviations usuelles. Ne pas traduire. Ne pas produire d’anglais."
+)
+CUDA_RUNTIME_ERROR_PATTERNS = (
+    "cublas",
+    "cudnn",
+    "cufft",
+    "curand",
+    "cusolver",
+    "cusparse",
+    "cudart",
+    "cuda driver",
+    "cuda runtime",
 )
 MATERIAL_DARK_THEME = {
     "background": "#06111f",
@@ -317,6 +330,11 @@ def read_message_attachment_file(path: Path) -> dict:
         "chars": len(clean),
         "truncated": truncated,
     }
+
+
+def is_cuda_runtime_error(error: Exception | str) -> bool:
+    message = str(error or "").casefold()
+    return any(pattern in message for pattern in CUDA_RUNTIME_ERROR_PATTERNS)
 
 
 @dataclass
@@ -470,6 +488,12 @@ class AssistantApp:
                 or "medium"
             )
         )
+        self.fly_dictation_device_var = tk.StringVar(
+            value=str(fly_dictation_config.get("device") or whisper_config.get("device") or "cpu")
+        )
+        self.fly_dictation_compute_var = tk.StringVar(
+            value=str(fly_dictation_config.get("compute_type") or whisper_config.get("compute_type") or "int8")
+        )
         self.result_destination_var = tk.StringVar(value="WEDA consultation")
         self.pdf_template_var = tk.StringVar(value="")
         self.pdf_prompt_var = tk.StringVar(value="")
@@ -514,6 +538,8 @@ class AssistantApp:
         self._fly_recording = False
         self._fly_busy = False
         self._fly_recorder: PushToTalkRecorder | None = None
+        self._fly_transcription_lock = threading.Lock()
+        self._fly_cuda_runtime_failed = False
 
         self._build_ui()
         self.install_live_message_refresh()
@@ -931,6 +957,26 @@ class AssistantApp:
         )
         self.fly_dictation_model_combo.pack(side=tk.LEFT, padx=(4, 8))
         self.fly_dictation_model_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_fly_dictation_settings())
+        ttk.Label(fly_bar, text="Device volée").pack(side=tk.LEFT, padx=(4, 0))
+        self.fly_dictation_device_combo = ttk.Combobox(
+            fly_bar,
+            textvariable=self.fly_dictation_device_var,
+            values=WHISPER_DEVICE_CHOICES,
+            width=7,
+            state="readonly",
+        )
+        self.fly_dictation_device_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.fly_dictation_device_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_fly_dictation_settings())
+        ttk.Label(fly_bar, text="Compute volée").pack(side=tk.LEFT, padx=(4, 0))
+        self.fly_dictation_compute_combo = ttk.Combobox(
+            fly_bar,
+            textvariable=self.fly_dictation_compute_var,
+            values=WHISPER_COMPUTE_CHOICES,
+            width=11,
+            state="readonly",
+        )
+        self.fly_dictation_compute_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.fly_dictation_compute_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_fly_dictation_settings())
         ttk.Label(fly_bar, text="relâcher pour transcrire et coller").pack(side=tk.LEFT)
 
         self.notebook = ttk.Notebook(self.root)
@@ -4018,6 +4064,14 @@ class AssistantApp:
             fly_model = str(self.fly_dictation_model_var.get() or "").strip()
             if fly_model:
                 settings["model"] = canonical_french_whisper_model_name(fly_model)
+        if hasattr(self, "fly_dictation_device_var"):
+            fly_device = str(self.fly_dictation_device_var.get() or "").strip()
+            if fly_device:
+                settings["device"] = fly_device
+        if hasattr(self, "fly_dictation_compute_var"):
+            fly_compute = str(self.fly_dictation_compute_var.get() or "").strip()
+            if fly_compute:
+                settings["compute_type"] = fly_compute
 
         settings.update(
             {
@@ -4031,12 +4085,17 @@ class AssistantApp:
                 "condition_on_previous_text": bool_setting("condition_on_previous_text", False),
                 "min_silence_duration_ms": int_setting("min_silence_duration_ms", 250, 100, 2000),
                 "vad_filter": bool_setting("vad_filter", False),
+                "without_timestamps": bool_setting("without_timestamps", True),
                 "initial_prompt": str(
                     fly_config.get("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
                     or ""
                 ),
             }
         )
+        if getattr(self, "_fly_cuda_runtime_failed", False) and str(settings.get("device") or "").lower() == "cuda":
+            settings["device"] = "cpu"
+            settings["compute_type"] = "int8"
+            settings["cuda_fallback_active"] = True
         return settings
 
     def micro_device_label_for_value(self, value: str) -> str:
@@ -4172,22 +4231,43 @@ class AssistantApp:
                 else fly_config.get("model") or fly_config.get("default_model") or self.config.get("whisper", {}).get("default_model")
             ).strip() or "medium"
         )
+        device = str(
+            self.fly_dictation_device_var.get()
+            if hasattr(self, "fly_dictation_device_var")
+            else fly_config.get("device") or self.config.get("whisper", {}).get("device")
+        ).strip() or "cpu"
+        if device not in WHISPER_DEVICE_CHOICES:
+            device = "cpu"
+        compute_type = str(
+            self.fly_dictation_compute_var.get()
+            if hasattr(self, "fly_dictation_compute_var")
+            else fly_config.get("compute_type") or self.config.get("whisper", {}).get("compute_type")
+        ).strip() or "int8"
+        if compute_type not in WHISPER_COMPUTE_CHOICES:
+            compute_type = "int8"
         return {
             "enabled": enabled,
             "key": key,
             "model": model,
+            "device": device,
+            "compute_type": compute_type,
             "min_seconds": max(0.05, min(5.0, min_seconds)),
             "paste_delay_ms": max(0, min(1000, paste_delay_ms)),
         }
 
     def save_fly_dictation_settings(self) -> None:
+        self._fly_cuda_runtime_failed = False
         settings = self.get_fly_dictation_settings()
         self.fly_dictation_key_var.set(settings["key"])
         self.fly_dictation_model_var.set(settings["model"])
+        self.fly_dictation_device_var.set(settings["device"])
+        self.fly_dictation_compute_var.set(settings["compute_type"])
         fly_config = self.config.setdefault("fly_dictation", {})
         fly_config["enabled"] = settings["enabled"]
         fly_config["key"] = settings["key"]
         fly_config["model"] = settings["model"]
+        fly_config["device"] = settings["device"]
+        fly_config["compute_type"] = settings["compute_type"]
         fly_config.setdefault("min_seconds", settings["min_seconds"])
         fly_config.setdefault("paste_delay_ms", settings["paste_delay_ms"])
         fly_config.setdefault("beam_size", 1)
@@ -4195,6 +4275,7 @@ class AssistantApp:
         fly_config.setdefault("temperature", 0.0)
         fly_config.setdefault("condition_on_previous_text", False)
         fly_config.setdefault("vad_filter", False)
+        fly_config.setdefault("without_timestamps", True)
         fly_config.setdefault("min_silence_duration_ms", 250)
         fly_config.setdefault("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
         fly_config.setdefault("preload_model", True)
@@ -4231,7 +4312,47 @@ class AssistantApp:
 
         def worker() -> None:
             try:
-                self.model_manager.load(whisper_settings)
+                model = self.model_manager.load(whisper_settings)
+                if whisper_settings.device == "cuda":
+                    try:
+                        self.validate_fly_cuda_runtime(model)
+                    except Exception as cuda_exc:
+                        self._fly_cuda_runtime_failed = True
+                        fallback_settings = WhisperSettings.from_mapping(
+                            self.fly_dictation_cpu_fallback_settings(self.get_fly_whisper_settings())
+                        )
+                        try:
+                            self.model_manager.unload_all()
+                            self.model_manager.load(fallback_settings)
+                        except Exception as fallback_exc:
+                            self.log_debug(
+                                "error",
+                                "app",
+                                "fly_dictation_cuda_cpu_fallback_preload_error",
+                                str(fallback_exc),
+                                {"cuda_error": str(cuda_exc)},
+                            )
+                            raise cuda_exc
+                        self.log_debug(
+                            "warning",
+                            "app",
+                            "fly_dictation_cuda_runtime_unavailable",
+                            "CUDA indisponible pour la volée, fallback CPU activé.",
+                            {
+                                "error": str(cuda_exc),
+                                "requested_model": whisper_settings.model_name,
+                                "requested_device": whisper_settings.device,
+                                "requested_compute_type": whisper_settings.compute_type,
+                                "fallback_device": fallback_settings.device,
+                                "fallback_compute_type": fallback_settings.compute_type,
+                            },
+                        )
+                        self.root.after(
+                            0,
+                            lambda: self.fly_dictation_status_var.set("Volée: CUDA indisponible, fallback CPU"),
+                        )
+                        self.root.after(0, lambda: self.model_status_var.set(f"Moteur STT: {self.model_manager.active_label()}"))
+                        return
                 self.log_debug(
                     "info",
                     "app",
@@ -4250,6 +4371,34 @@ class AssistantApp:
                 )
 
         threading.Thread(target=worker, name="fly-dictation-model-preload", daemon=True).start()
+
+    def validate_fly_cuda_runtime(self, model) -> None:
+        try:
+            import numpy as np
+        except ImportError:
+            return
+
+        audio = np.zeros(1600, dtype="float32")
+        segments, _info = model.transcribe(
+            audio,
+            language="fr",
+            task="transcribe",
+            beam_size=1,
+            best_of=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            initial_prompt="Test technique de disponibilité CUDA.",
+            temperature=0.0,
+            without_timestamps=True,
+        )
+        list(segments)
+
+    def fly_dictation_cpu_fallback_settings(self, whisper_settings: dict) -> dict:
+        fallback = dict(whisper_settings or {})
+        fallback["device"] = "cpu"
+        fallback["compute_type"] = "int8"
+        fallback["cuda_fallback_active"] = True
+        return fallback
 
     def uninstall_fly_dictation_hotkey(self) -> None:
         keyboard_module = self._fly_keyboard
@@ -4484,6 +4633,7 @@ class AssistantApp:
         self._fly_busy = True
         self.set_recording_indicator(False)
         self.micro_status_var.set("Micro: volée arrêtée")
+        settings = self.get_fly_dictation_settings()
         self.fly_dictation_status_var.set("Volée: transcription faster-whisper")
 
         try:
@@ -4496,7 +4646,6 @@ class AssistantApp:
             messagebox.showerror("Dictée à la volée", str(exc), parent=self.root)
             return
 
-        settings = self.get_fly_dictation_settings()
         if duration_seconds < settings["min_seconds"] or len(audio) == 0:
             self._fly_busy = False
             self.fly_dictation_status_var.set("Volée: appui trop court")
@@ -4512,7 +4661,13 @@ class AssistantApp:
         fly_whisper_settings = self.get_fly_whisper_settings()
         threading.Thread(
             target=self.run_fly_dictation_worker,
-            args=(audio, recorder.sample_rate, recorder.channels, duration_seconds, fly_whisper_settings),
+            args=(
+                audio,
+                recorder.sample_rate,
+                recorder.channels,
+                duration_seconds,
+                fly_whisper_settings,
+            ),
             name="fly-dictation-transcribe",
             daemon=True,
         ).start()
@@ -4525,37 +4680,87 @@ class AssistantApp:
         duration_seconds: float,
         whisper_settings: dict,
     ) -> None:
+        try:
+            result = self.transcribe_fly_dictation_audio_buffer(
+                audio,
+                sample_rate=sample_rate,
+                channels=channels,
+                whisper_settings=whisper_settings,
+                fallback_label="full",
+            )
+            self.root.after(0, self.on_fly_dictation_result, result, duration_seconds)
+        except Exception as exc:
+            self.root.after(0, self.on_fly_dictation_error, exc)
+
+    def transcribe_fly_dictation_audio_buffer(
+        self,
+        audio,
+        *,
+        sample_rate: int,
+        channels: int,
+        whisper_settings: dict,
+        fallback_label: str,
+    ):
         temp_dir = None
         audio_path = None
         auto_delete_audio = bool(self.config.get("security", {}).get("auto_delete_audio", True))
         try:
-            try:
-                result = self.transcriber.transcribe_audio_array(
-                    audio,
-                    sample_rate=sample_rate,
-                    channels=channels,
-                    segment_index=0,
-                    settings_override=whisper_settings,
-                )
-            except Exception as memory_exc:
-                self.log_debug(
-                    "warning",
-                    "app",
-                    "fly_dictation_memory_transcribe_fallback",
-                    "Transcription directe depuis la mémoire impossible, fallback WAV.",
-                    {"error": str(memory_exc), "sample_rate": sample_rate, "channels": channels},
-                )
-                temp_dir = Path(tempfile.mkdtemp(prefix="gemma_weda_fly_"))
-                audio_path = temp_dir / "dictee_volee.wav"
-                AudioRecorder(sample_rate=sample_rate, channels=channels).write_wav(audio_path, audio)
-                result = self.transcriber.transcribe_file(
-                    audio_path,
-                    segment_index=0,
-                    settings_override=whisper_settings,
-                )
-            self.root.after(0, self.on_fly_dictation_result, result, duration_seconds)
-        except Exception as exc:
-            self.root.after(0, self.on_fly_dictation_error, exc)
+            with self._fly_transcription_lock:
+                try:
+                    return self.transcriber.transcribe_audio_array(
+                        audio,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        segment_index=0,
+                        settings_override=whisper_settings,
+                    )
+                except Exception as memory_exc:
+                    if str((whisper_settings or {}).get("device") or "").lower() == "cuda" and is_cuda_runtime_error(memory_exc):
+                        self._fly_cuda_runtime_failed = True
+                        fallback_settings = self.fly_dictation_cpu_fallback_settings(whisper_settings)
+                        self.log_debug(
+                            "warning",
+                            "app",
+                            "fly_dictation_cuda_runtime_fallback",
+                            "Erreur CUDA pendant la volée, nouvelle tentative en CPU.",
+                            {
+                                "error": str(memory_exc),
+                                "fallback_label": fallback_label,
+                                "fallback_device": fallback_settings["device"],
+                                "fallback_compute_type": fallback_settings["compute_type"],
+                            },
+                        )
+                        self.root.after(
+                            0,
+                            lambda: self.fly_dictation_status_var.set("Volée: CUDA indisponible, fallback CPU"),
+                        )
+                        return self.transcriber.transcribe_audio_array(
+                            audio,
+                            sample_rate=sample_rate,
+                            channels=channels,
+                            segment_index=0,
+                            settings_override=fallback_settings,
+                        )
+                    self.log_debug(
+                        "warning",
+                        "app",
+                        "fly_dictation_memory_transcribe_fallback",
+                        "Transcription directe depuis la mémoire impossible, fallback WAV.",
+                        {
+                            "error": str(memory_exc),
+                            "sample_rate": sample_rate,
+                            "channels": channels,
+                            "fallback_label": fallback_label,
+                        },
+                    )
+                    temp_dir = Path(tempfile.mkdtemp(prefix="gemma_weda_fly_"))
+                    audio_path = temp_dir / "dictee_volee.wav"
+                    AudioRecorder(sample_rate=sample_rate, channels=channels).write_wav(audio_path, audio)
+                    return self.transcriber.transcribe_file(
+                        audio_path,
+                        segment_index=0,
+                        settings_override=whisper_settings,
+                    )
         finally:
             if auto_delete_audio and audio_path and temp_dir:
                 try:

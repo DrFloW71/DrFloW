@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import site
 import threading
 from dataclasses import dataclass
 
@@ -13,6 +15,8 @@ FRENCH_UNSAFE_WHISPER_MODEL_ALIASES = {
     "distil-medium.en": "medium",
     "distil-small.en": "small",
 }
+_DLL_DIRECTORY_HANDLES = []
+_DLL_DIRECTORIES_CONFIGURED = False
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,9 @@ class WhisperModelManager:
             if cached_model is not None:
                 self._active_settings = settings
                 return cached_model
+
+            if settings.device == "cuda":
+                configure_nvidia_dll_directories()
 
             try:
                 from faster_whisper import WhisperModel
@@ -85,6 +92,49 @@ def canonical_french_whisper_model_name(value: str, default: str = "medium") -> 
         base = normalized[:-3]
         return base or default
     return requested
+
+
+def configure_nvidia_dll_directories() -> list[str]:
+    global _DLL_DIRECTORIES_CONFIGURED
+    if os.name != "nt" or _DLL_DIRECTORIES_CONFIGURED:
+        return []
+
+    _DLL_DIRECTORIES_CONFIGURED = True
+    configured = []
+    roots = []
+    for getter in (site.getsitepackages,):
+        try:
+            roots.extend(getter())
+        except Exception:
+            pass
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    for root in roots:
+        nvidia_root = os.path.join(str(root), "nvidia")
+        if not os.path.isdir(nvidia_root):
+            continue
+        for package_name in os.listdir(nvidia_root):
+            bin_dir = os.path.join(nvidia_root, package_name, "bin")
+            if not os.path.isdir(bin_dir):
+                continue
+            try:
+                handle = os.add_dll_directory(bin_dir)
+                _DLL_DIRECTORY_HANDLES.append(handle)
+            except (AttributeError, FileNotFoundError, OSError):
+                pass
+            configured.append(bin_dir)
+
+    if configured:
+        current_path = os.environ.get("PATH", "")
+        existing = {part.casefold() for part in current_path.split(os.pathsep) if part}
+        additions = [path for path in configured if path.casefold() not in existing]
+        if additions:
+            os.environ["PATH"] = os.pathsep.join(additions + [current_path])
+
+    return configured
 
 
 def french_whisper_model_substitution_warning(requested: str, effective: str) -> str:

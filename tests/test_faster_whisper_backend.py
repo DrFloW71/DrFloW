@@ -84,6 +84,22 @@ class FasterWhisperBackendLanguageTests(unittest.TestCase):
             self.assertEqual(model.calls[0]["language"], "fr")
             self.assertEqual(model.calls[0]["task"], "transcribe")
 
+    def test_without_timestamps_option_is_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            write_silent_wav(audio_path)
+            model = FakeWhisperModel(language="fr")
+            backend = FasterWhisperBackend(FakeWhisperModelManager(model))
+
+            backend.transcribe_file(audio_path, {
+                "model": "large-v3-turbo",
+                "vad_filter": False,
+                "without_timestamps": True,
+                "audio_filter": {"enabled": False},
+            })
+
+            self.assertTrue(model.calls[0]["without_timestamps"])
+
     def test_silent_segment_is_skipped_before_model_transcribe(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "audio.wav"

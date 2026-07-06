@@ -205,6 +205,7 @@ def should_skip_audio_for_transcription(audio_stats: dict, config: dict | None =
     duration = float(audio_stats.get("duration_seconds") or 0.0)
     rms = float(audio_stats.get("rms") or 0.0)
     peak = float(audio_stats.get("peak") or 0.0)
+    non_silent_ratio = float(audio_stats.get("non_silent_ratio_0_005") or 0.0)
 
     if duration > 0 and duration < filter_config["min_duration_seconds"]:
         return True, "audio_too_short", filter_config
@@ -213,6 +214,7 @@ def should_skip_audio_for_transcription(audio_stats: dict, config: dict | None =
         filter_config["skip_silent_segments"]
         and rms < filter_config["min_rms_for_transcription"]
         and peak < filter_config["min_peak_for_transcription"]
+        and non_silent_ratio < 0.01
     ):
         return True, "audio_silent_or_wrong_input_device", filter_config
 

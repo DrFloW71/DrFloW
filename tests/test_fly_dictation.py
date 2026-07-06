@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from stt_audio_utils import should_skip_audio_for_transcription
 from transcriber import analyze_audio_array, prepare_audio_array_for_whisper
 from whisper_model_manager import WhisperModelManager, WhisperSettings, canonical_french_whisper_model_name
 
@@ -35,6 +36,28 @@ class FlyDictationAudioTests(unittest.TestCase):
         self.assertEqual(prepared.dtype, np.float32)
         self.assertTrue(prepared.flags["C_CONTIGUOUS"])
         self.assertAlmostEqual(float(prepared[0]), 0.03, places=6)
+
+    def test_audio_filter_keeps_low_level_probable_signal(self):
+        should_skip, reason, _config = should_skip_audio_for_transcription(
+            {
+                "duration_seconds": 2.0,
+                "rms": 0.0013,
+                "peak": 0.018,
+                "non_silent_ratio_0_005": 0.02,
+            },
+            {
+                "audio_filter": {
+                    "enabled": True,
+                    "min_rms_for_transcription": 0.0015,
+                    "min_peak_for_transcription": 0.02,
+                    "min_duration_seconds": 0.8,
+                    "skip_silent_segments": True,
+                }
+            },
+        )
+
+        self.assertFalse(should_skip)
+        self.assertEqual(reason, "")
 
 
 class WhisperModelManagerCacheTests(unittest.TestCase):
