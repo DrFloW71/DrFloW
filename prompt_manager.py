@@ -5,7 +5,7 @@ import re
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 VARIABLE_RE = re.compile(r"{{\s*([a-zA-Z0-9_]+)\s*}}")
@@ -39,8 +39,9 @@ class Prompt:
 
 
 class PromptManager:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, on_change: Callable[[str, Prompt], None] | None = None):
         self.path = Path(path)
+        self.on_change = on_change
         self.prompts: list[Prompt] = []
         self.load()
 
@@ -127,6 +128,7 @@ class PromptManager:
             self.set_default(prompt.id)
         else:
             self.save()
+            self._notify_change("create", prompt)
         return prompt
 
     def update(
@@ -147,6 +149,7 @@ class PromptManager:
         if prompt_type is not None:
             prompt.prompt_type = normalize_prompt_type(prompt_type)
         self.save()
+        self._notify_change("update", prompt)
         return prompt
 
     def duplicate(self, prompt_id: str, new_name: str | None = None) -> Prompt:
@@ -175,6 +178,14 @@ class PromptManager:
                     prompt.is_default = True
                     break
         self.save()
+
+    def _notify_change(self, action: str, prompt: Prompt) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(action, prompt)
+        except Exception:
+            return
 
     def set_default(self, prompt_id: str) -> None:
         found = False

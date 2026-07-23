@@ -2,7 +2,7 @@
   {
     "id": "medical_general",
     "name": "Médical général",
-    "content": "Consultation de médecine générale en français.",
+    "content": "Consultation de médecine générale en français entre un médecin et un patient. Transcription fidèle du dialogue médical : symptômes, évolution, négations, antécédents, traitements, posologies, allergies, examen clinique, résultats biologiques, dates, valeurs numériques et conseils donnés.",
     "is_default": true,
     "prompt_type": "generic"
   }

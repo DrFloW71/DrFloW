@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import wave
+import queue
 from pathlib import Path
 
 
@@ -143,6 +144,73 @@ class PushToTalkRecorder:
         if not self._started_at:
             return 0.0
         return max(0.0, time.perf_counter() - self._started_at)
+
+
+class StreamingAudioRecorder:
+    """Continuous local microphone stream yielding ordered NumPy chunks."""
+
+    def __init__(self, *, sample_rate: int = 16000, channels: int = 1, device=None, block_seconds: float = 0.25):
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.device = normalize_input_device(device)
+        self.block_seconds = max(0.05, float(block_seconds))
+        self._queue: queue.Queue = queue.Queue()
+        self._stream = None
+
+    def start(self) -> None:
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise RuntimeError("sounddevice n’est pas installé. Lance `pip install -r requirements.txt`.") from exc
+
+        if self._stream is not None:
+            return
+        self._queue = queue.Queue()
+
+        def on_audio(indata, _frames, _time_info, status):
+            if status:
+                self._queue.put(("status", str(status)))
+            if indata is not None and len(indata):
+                self._queue.put(("audio", indata.copy()))
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="float32",
+            device=self.device,
+            blocksize=max(1, int(self.sample_rate * self.block_seconds)),
+            callback=on_audio,
+        )
+        self._stream.start()
+
+    def read(self, timeout: float = 0.5):
+        try:
+            kind, value = self._queue.get(timeout=max(0.01, float(timeout)))
+        except queue.Empty:
+            return None
+        if kind == "status":
+            return None
+        return value
+
+    def stop(self) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+
+    def drain(self) -> list:
+        chunks = []
+        while True:
+            try:
+                kind, value = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "audio":
+                chunks.append(value)
+        return chunks
 
 
 def normalize_input_device(device):

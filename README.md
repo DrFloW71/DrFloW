@@ -65,6 +65,10 @@ powershell -ExecutionPolicy Bypass -File .\tools\install_git_hooks.ps1
 - Analyse secondaire optionnelle : si `Activer Prompt 2` est coché, l’application lance Prompt 2 après un Résultat 1 valide et conserve Résultat 1 même si Prompt 2 échoue.
 - Le message LM Studio distingue la transcription du jour du contexte WEDA, qui correspond aux consultations récentes et données médicales du dossier.
 - Taille de fenêtre mémorisée automatiquement après redimensionnement.
+- Bandeau permanent de verrou patient : identité du dossier, fraîcheur du contexte et PatDk restent visibles ; un résultat généré pour un autre dossier ne peut pas être préparé pour import WEDA.
+- Bouton `Diagnostic DrFloW` pour vérifier localement Python, configuration, micro, STT, LM Studio, serveur, pont WEDA et protections Git, avec rapport anonymisé copiable.
+- Annulation des générations LM Studio en cours, progression en temps réel et lecture des réponses en flux quand l’API locale le permet.
+- Historique local des versions de prompts, comparaison de versions/résultats et métriques techniques sans texte clinique dans `data/`.
 - Réglage graphique de la temporisation avant récupération du contexte WEDA.
 - Mode `Connecteur WEDA actif` avec touches de déclenchement/arrêt configurables.
 - Dictée segmentée par blocs, transcription en arrière-plan, modèle Whisper actif et micro d’entrée modifiables.
@@ -76,6 +80,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\install_git_hooks.ps1
 - Gestion d’une liste d’abréviations dans `abbreviations.csv`, éditable depuis l’onglet `Abréviations`.
 - Appel LM Studio compatible OpenAI en HTTP local.
 - Historique local optionnel dans `data/history.jsonl`.
+- La dernière transcription visible est conservée dans `data/last_transcription.json` à la fermeture normale et restaurée automatiquement au lancement suivant. Effacer la transcription ou démarrer une nouvelle dictée supprime ce brouillon local.
 - Serveur local standard library avec `/health`, `/weda/context`, `/weda/latest-result`, `/weda/import-request`, `/weda/import-status`, `/connector/start`, `/connector/stop`, `/connector/status`, `/debug/logs` et `/debug/log`.
 - Script Tampermonkey minimal dans `tampermonkey/weda_bridge.user.js`.
 
@@ -99,6 +104,31 @@ En mode `Connecteur WEDA actif`, les touches configurées dans l’interface rem
 
 Le pont mémorise le travail en cours dans `localStorage` pour reprendre après les navigations WEDA. En cas de page ou bouton introuvable, il affiche un badge et laisse un fallback manuel avec logs.
 
+## Transcription médicale progressive Large-v3
+
+La dictée principale utilise par défaut `faster-whisper` avec le modèle complet `large-v3`, CUDA, FP16, français forcé, `beam_size=5` et `temperature=0`. L’audio est capturé en continu puis transcrit dans l’ordre par fenêtres de 30 secondes avec 2 secondes de chevauchement. À l’arrêt, toute fin de consultation encore en mémoire est transcrite, même si elle dure moins de 30 secondes. La répétition textuelle due au chevauchement est retirée par comparaison déterministe des mots, sans rapprochement approximatif des nombres, doses ou latéralités.
+
+L’onglet `Prompt Whisper` contient le prompt médical fixe, un bouton de restauration, les options d’enrichissement WEDA et le lexique permanent local. `Diagnostic Whisper` montre localement le prompt final et les hotwords réellement préparés. Le contexte dynamique est nettoyé, limité à 800 caractères et n’inclut pas l’identité administrative du patient. Si la version installée de `faster-whisper` ne comprend pas `hotwords`, DrFloW le signale puis poursuit avec le prompt dynamique.
+
+L’onglet principal `Transcription` regroupe les deux niveaux dans deux sous-onglets distincts :
+
+- `Transcription brute` conserve la sortie assemblée du moteur, uniquement dédupliquée techniquement ;
+- `Transcription corrigée` est éditable et sert aux analyses Gemma lorsqu’elle n’est pas vide ;
+- les Résultats 1, 2 et 3 restent les productions Gemma et n’écrasent jamais les deux transcriptions.
+
+Une correction n’est mémorisée qu’après `Comparer les corrections`, puis `Valider explicitement`. Le stockage est local et atomique dans `data/transcription_corrections.json`. Les corrections médicales validées peuvent enrichir les hotwords. Leur application automatique est désactivée par défaut ; lorsqu’elle est activée, elle exige au moins trois validations, une source non ambiguë et exclut négations, nombres, unités critiques et latéralités.
+
+### Procédure de test manuel
+
+1. Démarrer DrFloW sans contexte WEDA et vérifier dans `Moteur de transcription` : `faster-whisper`, `large-v3`, `cuda`, `float16`.
+2. Enregistrer une consultation de plus de deux minutes et confirmer que du texte apparaît environ toutes les 28 secondes, dans l’ordre, sans phrase répétée aux jonctions.
+3. Arrêter au milieu d’une fenêtre et vérifier que la dernière phrase apparaît après la fin de la file de transcription.
+4. Charger un contexte WEDA contenant plusieurs médicaments, ouvrir `Prompt Whisper` puis `Diagnostic Whisper`, et vérifier le contexte nettoyé ainsi que les hotwords.
+5. Modifier et enregistrer le prompt Whisper, redémarrer l’application et vérifier sa persistance ; utiliser `Restaurer le prompt par défaut` pour revenir au texte livré.
+6. Dans `Transcription` > `Transcription corrigée`, corriger volontairement un terme, comparer puis valider explicitement. Vérifier la création de `data/transcription_corrections.json`.
+7. Répéter la même correction et vérifier que `validation_count` augmente au lieu de créer un doublon.
+8. Vérifier enfin que `Transcription` > `Transcription brute` est restée inchangée et que Prompts/Résultats 1 et 2 fonctionnent comme avant.
+
 ## Debug
 
 Les logs applicatifs sont visibles dans l’onglet `Logs` de l’application et enregistrés localement dans :
@@ -118,6 +148,8 @@ L’onglet `Abréviations` n’est pas utilisé comme prompt Whisper ni envoyé 
 Le pont Tampermonkey envoie aussi ses événements au serveur local. Si l’import ne trouve pas le champ WEDA, ouvrir la page de consultation du patient puis cliquer `Importer résultat`. Le script cible maintenant en priorité le champ de consultation WEDA, mémorise aussi le dernier champ éditable fiable et cherche dans les iframes accessibles.
 
 Le réglage `Délai contexte (s)` dans l’application contrôle l’attente entre le clic `Envoyer contexte` dans WEDA et la lecture effective du contexte. La valeur par défaut est `60` secondes, comme le module contexte du connecteur Heidi-WEDA.
+
+Le contexte WEDA reste valide sans limite de durée. L’import exige toujours un PatDk identique à celui capturé au moment de la génération : un changement de dossier patient verrouille donc les anciens résultats, indépendamment de leur ancienneté.
 
 Le contexte WEDA n’est pas une transcription et ne doit pas interférer avec la fidélité de l’oral. Il sert après transcription, avec la transcription du jour, à préciser des informations, lever des ambiguïtés et rédiger des documents médicaux cohérents à partir du dossier.
 

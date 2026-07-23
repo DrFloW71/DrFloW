@@ -17,6 +17,7 @@ def utc_now_iso() -> str:
 class WedaImportRequest:
     id: str
     result_text: str
+    result_html: str = ""
     patient_id: str = ""
     patient_identity: str = ""
     destination: str = "active_field"
@@ -36,6 +37,7 @@ class WedaImportManager:
         self,
         result_text: str,
         *,
+        result_html: str = "",
         patient_id: str = "",
         patient_identity: str = "",
         destination: str = "active_field",
@@ -43,6 +45,7 @@ class WedaImportManager:
         request = WedaImportRequest(
             id=uuid.uuid4().hex,
             result_text=result_text,
+            result_html=result_html,
             patient_id=patient_id,
             patient_identity=patient_identity,
             destination=destination,

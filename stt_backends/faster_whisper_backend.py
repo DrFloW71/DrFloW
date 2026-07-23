@@ -27,6 +27,8 @@ FORCED_FRENCH_WARNING = (
     "Attention : le moteur a détecté une langue différente du français malgré le forçage. "
     "Vérifier la transcription."
 )
+MAX_COMBINED_CONTEXT_BIAS_TOKENS = 240
+MAX_INITIAL_PROMPT_BIAS_TOKENS = 160
 
 
 class FasterWhisperBackend(STTBackend):
@@ -126,23 +128,34 @@ class FasterWhisperBackend(STTBackend):
         model = self.model_manager.load(settings)
 
         vad_filter_enabled = bool_setting(settings_map.get("vad_filter"), True)
-        text, segments, segments_count, detected_language = self._run_transcribe(
+        text, segments, segments_count, detected_language, hotwords_supported, context_bias_diagnostics = self._run_transcribe(
             model,
             audio_source,
             settings_map,
             vad_filter=vad_filter_enabled,
         )
         retry_without_vad = False
+        if context_bias_diagnostics.get("trimmed"):
+            warnings.append(
+                "Prompt Whisper et hotwords ajustés automatiquement à la fenêtre de contexte du modèle."
+            )
+        if not hotwords_supported and settings_map.get("hotwords"):
+            warnings.append(
+                "Cette version de faster-whisper ne prend pas en charge le paramètre hotwords ; "
+                "transcription poursuivie avec le prompt dynamique."
+            )
 
         if not text and vad_filter_enabled and audio_has_probable_signal(audio_stats, settings_map):
             retry_without_vad = True
             warnings.append("Aucun texte avec VAD, retry automatique sans VAD.")
-            text, segments, segments_count, detected_language = self._run_transcribe(
+            text, segments, segments_count, detected_language, retry_hotwords_supported, retry_bias_diagnostics = self._run_transcribe(
                 model,
                 audio_source,
                 settings_map,
                 vad_filter=False,
             )
+            hotwords_supported = hotwords_supported and retry_hotwords_supported
+            context_bias_diagnostics = retry_bias_diagnostics
 
         if detected_language and not is_french_language_code(detected_language):
             warnings.append(FORCED_FRENCH_WARNING)
@@ -183,16 +196,35 @@ class FasterWhisperBackend(STTBackend):
                     "requested_model": requested_model,
                     "effective_model": settings.model_name,
                     "detected_language": detected_language,
+                    "prompt_length": context_bias_diagnostics.get("initial_prompt_characters", 0),
+                    "prompt_tokens": context_bias_diagnostics.get("initial_prompt_tokens", 0),
+                    "hotwords_count": int(settings_map.get("hotwords_count") or 0),
+                    "hotwords_tokens": context_bias_diagnostics.get("hotwords_tokens", 0),
+                    "hotwords_supported": hotwords_supported,
+                    "context_bias_trimmed": context_bias_diagnostics.get("trimmed", False),
                 },
             }
         )
 
-    def _run_transcribe(self, model, audio_source, settings_map: dict, *, vad_filter: bool) -> tuple[str, list[dict], int, str]:
+    def _run_transcribe(
+        self,
+        model,
+        audio_source,
+        settings_map: dict,
+        *,
+        vad_filter: bool,
+    ) -> tuple[str, list[dict], int, str, bool, dict]:
         condition_on_previous_text = False
         initial_prompt = str(
             settings_map.get("initial_prompt")
             or settings_map.get("stt_context_bias")
             or FORCED_FRENCH_INITIAL_PROMPT
+        )
+        hotwords = str(settings_map.get("hotwords") or "").strip()
+        initial_prompt, hotwords, context_bias_diagnostics = fit_whisper_context_bias(
+            model,
+            initial_prompt,
+            hotwords,
         )
         vad_parameters = dict(settings_map.get("vad_parameters") or {})
         vad_parameters.setdefault("min_silence_duration_ms", int(settings_map.get("min_silence_duration_ms") or 700))
@@ -212,11 +244,25 @@ class FasterWhisperBackend(STTBackend):
         }
         if settings_map.get("best_of") is not None:
             transcribe_kwargs["best_of"] = int(settings_map.get("best_of") or 1)
+        if settings_map.get("max_new_tokens") is not None:
+            max_new_tokens = int(settings_map.get("max_new_tokens") or 0)
+            if max_new_tokens > 0:
+                transcribe_kwargs["max_new_tokens"] = max_new_tokens
         if vad_filter:
             transcribe_kwargs["vad_parameters"] = vad_parameters
+        if hotwords:
+            transcribe_kwargs["hotwords"] = hotwords
 
         source = str(audio_source) if isinstance(audio_source, (str, Path)) else audio_source
-        segments, info = model.transcribe(source, **transcribe_kwargs)
+        hotwords_supported = True
+        try:
+            segments, info = model.transcribe(source, **transcribe_kwargs)
+        except TypeError as exc:
+            if "hotwords" not in transcribe_kwargs or "hotword" not in str(exc).lower():
+                raise
+            transcribe_kwargs.pop("hotwords", None)
+            hotwords_supported = False
+            segments, info = model.transcribe(source, **transcribe_kwargs)
         detected_language = str(getattr(info, "language", "") or "").strip()
         segment_list = list(segments)
         normalized_segments = []
@@ -234,7 +280,14 @@ class FasterWhisperBackend(STTBackend):
                 }
             )
         text = " ".join(segment["text"] for segment in normalized_segments).strip()
-        return text, normalized_segments, len(segment_list), detected_language
+        return (
+            text,
+            normalized_segments,
+            len(segment_list),
+            detected_language,
+            hotwords_supported,
+            context_bias_diagnostics,
+        )
 
     def health_check(self) -> dict:
         return {
@@ -254,6 +307,81 @@ class FasterWhisperBackend(STTBackend):
 def is_french_language_code(value: str) -> bool:
     normalized = str(value or "").strip().lower()
     return not normalized or normalized == "fr" or normalized.startswith("fr-") or normalized == "fra"
+
+
+def fit_whisper_context_bias(
+    model,
+    initial_prompt: str,
+    hotwords: str,
+    *,
+    max_combined_tokens: int = MAX_COMBINED_CONTEXT_BIAS_TOKENS,
+    max_initial_prompt_tokens: int = MAX_INITIAL_PROMPT_BIAS_TOKENS,
+) -> tuple[str, str, dict]:
+    """Keep prompt + hotwords below Faster-Whisper's shared 448-position limit."""
+
+    prompt = str(initial_prompt or "").strip()
+    words = str(hotwords or "").strip()
+    tokenizer = getattr(model, "hf_tokenizer", None)
+    encode = getattr(tokenizer, "encode", None)
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(encode) or not callable(decode):
+        # Conservative character fallback for fake/older model wrappers.
+        prompt_limit = max(0, int(max_initial_prompt_tokens) * 3)
+        total_limit = max(0, int(max_combined_tokens) * 3)
+        fitted_prompt = prompt[:prompt_limit].rsplit(" ", 1)[0] if len(prompt) > prompt_limit else prompt
+        remaining = max(0, total_limit - len(fitted_prompt))
+        fitted_hotwords = _fit_hotword_characters(words, remaining)
+        return fitted_prompt, fitted_hotwords, {
+            "initial_prompt_characters": len(fitted_prompt),
+            "initial_prompt_tokens": 0,
+            "hotwords_tokens": 0,
+            "trimmed": fitted_prompt != prompt or fitted_hotwords != words,
+        }
+
+    def token_ids(value: str) -> list[int]:
+        try:
+            encoded = encode(value, add_special_tokens=False)
+        except TypeError:
+            encoded = encode(value)
+        ids = getattr(encoded, "ids", encoded)
+        return list(ids)
+
+    prompt_ids = token_ids(prompt)
+    prompt_budget = min(max(0, int(max_initial_prompt_tokens)), max(0, int(max_combined_tokens)))
+    fitted_prompt_ids = prompt_ids[:prompt_budget]
+    fitted_prompt = str(decode(fitted_prompt_ids, skip_special_tokens=True)).strip() if fitted_prompt_ids else ""
+    remaining_tokens = max(0, int(max_combined_tokens) - len(fitted_prompt_ids))
+
+    accepted_terms: list[str] = []
+    hotword_ids: list[int] = []
+    for term in (item.strip() for item in words.split(",")):
+        if not term:
+            continue
+        candidate = ", ".join([*accepted_terms, term])
+        candidate_ids = token_ids(" " + candidate)
+        if len(candidate_ids) > remaining_tokens:
+            break
+        accepted_terms.append(term)
+        hotword_ids = candidate_ids
+    fitted_hotwords = ", ".join(accepted_terms)
+    return fitted_prompt, fitted_hotwords, {
+        "initial_prompt_characters": len(fitted_prompt),
+        "initial_prompt_tokens": len(fitted_prompt_ids),
+        "hotwords_tokens": len(hotword_ids),
+        "trimmed": fitted_prompt != prompt or fitted_hotwords != words,
+    }
+
+
+def _fit_hotword_characters(hotwords: str, maximum: int) -> str:
+    accepted: list[str] = []
+    for term in (item.strip() for item in str(hotwords or "").split(",")):
+        if not term:
+            continue
+        candidate = ", ".join([*accepted, term])
+        if len(candidate) > max(0, int(maximum)):
+            break
+        accepted.append(term)
+    return ", ".join(accepted)
 
 
 def bool_setting(value, default: bool = False) -> bool:

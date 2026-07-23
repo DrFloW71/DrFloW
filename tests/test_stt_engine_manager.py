@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from stt_backends.base import format_text_with_speaker_mapping, normalize_stt_result
-from stt_engine_manager import STTEngineManager
+from stt_engine_manager import STTEngineManager, backend_config_for
 from whisper_model_manager import WhisperModelManager
 
 
@@ -33,6 +33,32 @@ class STTNormalizationTests(unittest.TestCase):
 
 
 class STTEngineManagerTests(unittest.TestCase):
+    def test_top_level_fly_overrides_win_over_main_faster_whisper_context(self):
+        config = {
+            "engine": "faster-whisper",
+            "faster_whisper": {
+                "model": "large-v3",
+                "initial_prompt": "Prompt principal WEDA très long",
+                "hotwords": "Eliquis, metformine",
+                "beam_size": 5,
+            },
+            "model": "large-v3-turbo",
+            "initial_prompt": "Dictée courte",
+            "hotwords": "",
+            "hotwords_count": 0,
+            "beam_size": 1,
+            "max_new_tokens": 128,
+        }
+
+        result = backend_config_for(config, "faster-whisper")
+
+        self.assertEqual(result["model"], "large-v3-turbo")
+        self.assertEqual(result["initial_prompt"], "Dictée courte")
+        self.assertEqual(result["hotwords"], "")
+        self.assertEqual(result["hotwords_count"], 0)
+        self.assertEqual(result["beam_size"], 1)
+        self.assertEqual(result["max_new_tokens"], 128)
+
     def test_external_cli_backend_reads_output_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

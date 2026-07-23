@@ -6,10 +6,27 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 
-from stt_backends.faster_whisper_backend import FORCED_FRENCH_WARNING, FasterWhisperBackend
+from stt_backends.faster_whisper_backend import (
+    FORCED_FRENCH_WARNING,
+    FasterWhisperBackend,
+    fit_whisper_context_bias,
+)
 
 
 class FasterWhisperBackendLanguageTests(unittest.TestCase):
+    def test_combined_prompt_and_hotwords_are_kept_below_model_limit(self):
+        model = SimpleNamespace(hf_tokenizer=FakeTokenizer())
+        prompt, hotwords, diagnostics = fit_whisper_context_bias(
+            model,
+            " ".join(f"prompt{i}" for i in range(300)),
+            ", ".join(f"hotword{i}" for i in range(300)),
+        )
+
+        self.assertLessEqual(diagnostics["initial_prompt_tokens"] + diagnostics["hotwords_tokens"], 240)
+        self.assertLessEqual(diagnostics["initial_prompt_tokens"], 160)
+        self.assertTrue(diagnostics["trimmed"])
+        self.assertTrue(prompt)
+        self.assertTrue(hotwords)
     def test_transcribe_forces_french_transcription_even_if_config_disagrees(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "audio.wav"
@@ -100,6 +117,22 @@ class FasterWhisperBackendLanguageTests(unittest.TestCase):
 
             self.assertTrue(model.calls[0]["without_timestamps"])
 
+    def test_max_new_tokens_limits_short_workflow_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            write_silent_wav(audio_path)
+            model = FakeWhisperModel(language="fr")
+            backend = FasterWhisperBackend(FakeWhisperModelManager(model))
+
+            backend.transcribe_file(audio_path, {
+                "model": "large-v3-turbo",
+                "vad_filter": False,
+                "max_new_tokens": 128,
+                "audio_filter": {"enabled": False},
+            })
+
+            self.assertEqual(model.calls[0]["max_new_tokens"], 128)
+
     def test_silent_segment_is_skipped_before_model_transcribe(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "audio.wav"
@@ -129,6 +162,41 @@ class FasterWhisperBackendLanguageTests(unittest.TestCase):
             self.assertEqual(result["raw"]["empty_reason"], "audio_silent_or_wrong_input_device")
             self.assertTrue(any("Segment 2 ignoré" in warning for warning in result["warnings"]))
 
+    def test_hotwords_are_forwarded_when_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            write_silent_wav(audio_path)
+            model = FakeWhisperModel(language="fr")
+            backend = FasterWhisperBackend(FakeWhisperModelManager(model))
+            result = backend.transcribe_file(audio_path, {
+                "model": "large-v3",
+                "vad_filter": False,
+                "hotwords": "Eliquis, metformine",
+                "hotwords_count": 2,
+                "audio_filter": {"enabled": False},
+            })
+            self.assertEqual(model.calls[0]["hotwords"], "Eliquis, metformine")
+            self.assertTrue(result["raw"]["hotwords_supported"])
+            self.assertEqual(result["raw"]["hotwords_count"], 2)
+
+    def test_unsupported_hotwords_retry_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            write_silent_wav(audio_path)
+            model = FakeWhisperModelWithoutHotwords(language="fr")
+            backend = FasterWhisperBackend(FakeWhisperModelManager(model))
+            result = backend.transcribe_file(audio_path, {
+                "model": "large-v3",
+                "vad_filter": False,
+                "hotwords": "Eliquis",
+                "hotwords_count": 1,
+                "audio_filter": {"enabled": False},
+            })
+            self.assertEqual(len(model.calls), 2)
+            self.assertNotIn("hotwords", model.calls[-1])
+            self.assertFalse(result["raw"]["hotwords_supported"])
+            self.assertTrue(any("ne prend pas en charge" in warning for warning in result["warnings"]))
+
 
 class FakeSegment:
     start = 0.0
@@ -146,6 +214,14 @@ class FakeWhisperModel:
         return [FakeSegment()], SimpleNamespace(language=self.language)
 
 
+class FakeWhisperModelWithoutHotwords(FakeWhisperModel):
+    def transcribe(self, _source, **kwargs):
+        self.calls.append(dict(kwargs))
+        if "hotwords" in kwargs:
+            raise TypeError("unexpected keyword argument 'hotwords'")
+        return [FakeSegment()], SimpleNamespace(language=self.language)
+
+
 class FakeWhisperModelManager:
     def __init__(self, model):
         self.model = model
@@ -157,6 +233,16 @@ class FakeWhisperModelManager:
 
     def active_label(self):
         return "fake-model"
+
+
+class FakeTokenizer:
+    def encode(self, value, add_special_tokens=False):
+        del add_special_tokens
+        return SimpleNamespace(ids=str(value).split())
+
+    def decode(self, values, skip_special_tokens=True):
+        del skip_special_tokens
+        return " ".join(values)
 
 
 def write_silent_wav(path: Path) -> None:

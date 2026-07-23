@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Connecteur DrFloW - WEDA 
 // @namespace    http://tampermonkey.net/
-// @version      0.5.9
+// @version      0.5.14
 // @description  Pont local WEDA vers DrFloW : contexte patient et import manuel contrôlé.
 // @match        https://secure.weda.fr/*
 // @run-at       document-idle
@@ -54,6 +54,8 @@
     const CONNECTOR_IMPORT_LOCK_KEY = 'gemma_weda_assistant_connector_import_lock_v1';
     const CONNECTOR_IMPORTED_REQUESTS_KEY = 'gemma_weda_assistant_connector_imported_requests_v1';
     const CONNECTOR_SETTINGS_REFRESH_MS = 15000;
+    const CONTEXT_REFRESH_POLL_MS = 1000;
+    const CONTEXT_REFRESH_ACTIVE_TAB_KEY = 'drflow_weda_context_active_tab_v1';
     const CONNECTOR_POLL_INTERVAL_MS = 2500;
     const CONNECTOR_RESULT_TIMEOUT_MS = 180000;
     const CONNECTOR_PENDING_MAX_AGE_MS = 10 * 60 * 1000;
@@ -107,11 +109,13 @@
         enabled: false,
         start_key: 'PageUp',
         stop_key: 'PageDown',
+        document_now_key: 'F8',
         auto_return_home: true
     };
     let connectorShortcutInstalled = false;
     let connectorLastShortcutAt = 0;
     let connectorWorkflowBusy = false;
+    let connectorDocumentNowBusy = false;
     let flyDictationSettings = {
         enabled: true,
         key: '²'
@@ -121,6 +125,42 @@
     let wedaRecordingIndicatorActive = false;
     let wedaOriginalTitle = '';
     let wedaOriginalFaviconHref = null;
+    const contextRefreshResponderId = (
+        Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+    );
+    let contextRefreshPollBusy = false;
+
+    function markWedaContextTabActive() {
+        try {
+            localStorage.setItem(CONTEXT_REFRESH_ACTIVE_TAB_KEY, JSON.stringify({
+                responderId: contextRefreshResponderId,
+                at: Date.now(),
+                href: location.href
+            }));
+        } catch (_) {}
+    }
+
+    function isPreferredWedaContextTab() {
+        try {
+            const raw = localStorage.getItem(CONTEXT_REFRESH_ACTIVE_TAB_KEY);
+            const active = raw ? JSON.parse(raw) : null;
+            return !!active && active.responderId === contextRefreshResponderId;
+        } catch (_) {
+            return true;
+        }
+    }
+
+    window.addEventListener('focus', markWedaContextTabActive, true);
+    document.addEventListener('pointerdown', markWedaContextTabActive, true);
+    document.addEventListener('keydown', markWedaContextTabActive, true);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && document.hasFocus()) {
+            markWedaContextTabActive();
+        }
+    });
+    if (document.visibilityState !== 'hidden' && document.hasFocus()) {
+        markWedaContextTabActive();
+    }
 
     function normalizeSpaces(text) {
         return String(text || '')
@@ -1211,6 +1251,103 @@
             showBadge('Contexte WEDA envoyé à l’assistant local.');
         }
         return context;
+    }
+
+    async function pollWedaContextRefreshRequest() {
+        if (
+            contextRefreshPollBusy
+            || document.visibilityState === 'hidden'
+            || !isPreferredWedaContextTab()
+        ) return;
+        contextRefreshPollBusy = true;
+        let request = null;
+        try {
+            const response = await requestJson('GET', '/weda/context-refresh-request');
+            request = response && response.request ? response.request : null;
+            if (!request || !request.id || request.status !== 'pending') return;
+
+            const claimResponse = await requestJson('POST', '/weda/context-refresh-claim', {
+                request_id: request.id,
+                responder_id: contextRefreshResponderId,
+                page_url: location.href,
+                page_title: document.title || '',
+                visibility_state: document.visibilityState || '',
+                has_focus: typeof document.hasFocus === 'function' ? document.hasFocus() : false
+            });
+            if (!claimResponse || !claimResponse.claimed) return;
+
+            showBadge('DrFloW demande une nouvelle lecture du contexte WEDA...');
+            logEvent(
+                'info',
+                'weda_context_refresh_claimed',
+                'Nouvelle lecture du contexte demandée par DrFloW.',
+                {
+                    requestId: request.id,
+                    href: location.href,
+                    isPatientHome: isWedaPatientHomePage(),
+                    isConsultation: isWedaConsultationPage()
+                }
+            );
+
+            try {
+                const context = await sendContext({
+                    source: 'app_refresh_request',
+                    skipDelay: true,
+                    silent: true
+                });
+                await requestJson('POST', '/weda/context-refresh-ack', {
+                    request_id: request.id,
+                    responder_id: contextRefreshResponderId,
+                    status: 'success',
+                    patient_id_present: !!context.patient_id,
+                    visible_text_length: String(context.visible_text || '').length,
+                    page_url: location.href
+                });
+                showBadge('Contexte WEDA relu et actualisé dans DrFloW.');
+                logEvent(
+                    'info',
+                    'weda_context_refresh_done',
+                    'Contexte WEDA relu à la demande de DrFloW.',
+                    {
+                        requestId: request.id,
+                        patientIdPresent: !!context.patient_id,
+                        visibleTextLength: String(context.visible_text || '').length
+                    }
+                );
+            } catch (error) {
+                const errorMessage = error && error.message ? error.message : String(error);
+                try {
+                    await requestJson('POST', '/weda/context-refresh-ack', {
+                        request_id: request.id,
+                        responder_id: contextRefreshResponderId,
+                        status: 'error',
+                        error: errorMessage,
+                        page_url: location.href
+                    });
+                } catch (_) {}
+                showBadge('Contexte WEDA : actualisation impossible. Voir les logs.', true);
+                logEvent(
+                    'error',
+                    'weda_context_refresh_error',
+                    'Erreur pendant la relecture du contexte WEDA.',
+                    { requestId: request.id, error: errorMessage }
+                );
+            }
+        } catch (error) {
+            if (request && request.id) {
+                logEvent(
+                    'warning',
+                    'weda_context_refresh_poll_error',
+                    'Erreur de suivi de la demande de contexte.',
+                    {
+                        requestId: request.id,
+                        error: error && error.message ? error.message : String(error)
+                    }
+                );
+            }
+        } finally {
+            contextRefreshPollBusy = false;
+        }
     }
 
     function ownerDocumentOf(el) {
@@ -2968,7 +3105,7 @@
         resetStructuredWedaCorrections();
         const pressures = extractWedaBloodPressuresFromText(text);
         const report = {
-            version: '0.5.7',
+            version: '0.5.14',
             timestamp: Date.now(),
             context,
             fields: {
@@ -3602,30 +3739,296 @@
         return source.replace(placeholderPattern, (_, index) => preservedTags[Number(index)] || '');
     }
 
+    const WEDA_SECTION_HEADING_LABELS = new Set([
+        'allergies',
+        'antecedents',
+        'atcd',
+        'avis',
+        'biologie',
+        'cat',
+        'compte rendu',
+        'conclusion',
+        'conduite a tenir',
+        'constantes',
+        'contexte',
+        'courrier',
+        'diagnostic',
+        'diagnostics',
+        'documents',
+        'evolution',
+        'examen',
+        'examen clinique',
+        'histoire',
+        'imagerie',
+        'interrogatoire',
+        'motif',
+        'ordonnance',
+        'plan',
+        'prise en charge',
+        'resume',
+        'resultats',
+        'suivi',
+        'surveillance',
+        'synthese',
+        'traitement',
+        'traitements'
+    ]);
+
+    function markdownInlineToPlainText(text) {
+        return String(text || '')
+            .replace(/<\/?\s*br\s*\/?\s*>/gi, '\n')
+            .replace(/<[^>]+>/g, '')
+            .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+            .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+            .replace(/`([^`]*)`/g, '$1')
+            .replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/__([^_]+)__/g, '$1')
+            .replace(/\+\+([^+]+)\+\+/g, '$1')
+            .replace(/~~([^~]+)~~/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/_([^_]+)_/g, '$1')
+            .trim();
+    }
+
+    function normalizeSectionHeadingLabel(text) {
+        return markdownInlineToPlainText(text)
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function isSectionHeadingLabel(text) {
+        return WEDA_SECTION_HEADING_LABELS.has(normalizeSectionHeadingLabel(text));
+    }
+
+    function splitWedaSectionHeadingLine(line) {
+        const stripped = String(line || '').trim();
+        if (!stripped) return null;
+
+        const colon = stripped.match(/^(.{2,60}?)(\s*:\s*)(.*)$/);
+        if (colon && isSectionHeadingLabel(colon[1])) {
+            return {
+                label: colon[1].trim() + colon[2].replace(/\s+$/g, ''),
+                suffix: colon[3].trim()
+            };
+        }
+
+        if (stripped.length <= 60 && isSectionHeadingLabel(stripped)) {
+            return { label: stripped, suffix: '' };
+        }
+
+        return null;
+    }
+
     function markdownToWedaSafeHtml(text) {
         return String(text || '')
             .replace(/\r\n?/g, '\n')
             .split('\n')
             .map(line => {
                 const heading = line.match(/^\s{0,3}#{1,6}\s+(.+)$/);
-                if (heading) return '<strong>' + markdownInlineToSafeHtml(heading[1]) + '</strong>';
+                if (heading) return '<strong><u>' + markdownInlineToSafeHtml(heading[1]) + '</u></strong>';
+                const sectionHeading = splitWedaSectionHeadingLine(line);
+                if (sectionHeading) {
+                    const label = '<strong><u>' + markdownInlineToSafeHtml(sectionHeading.label) + '</u></strong>';
+                    return sectionHeading.suffix ? label + ' ' + markdownInlineToSafeHtml(sectionHeading.suffix) : label;
+                }
                 return markdownInlineToSafeHtml(line);
             })
             .join('<br>');
     }
 
-    function appendFormattedTextToContentEditable(el, text) {
+    function sanitizeWedaSafeHtmlFragment(html, doc = document) {
+        const allowedTags = {
+            strong: 'strong',
+            b: 'strong',
+            em: 'em',
+            i: 'em',
+            u: 'u',
+            s: 's',
+            strike: 's',
+            del: 's',
+            br: 'br'
+        };
+        const template = doc.createElement('template');
+        template.innerHTML = String(html || '');
+
+        function cleanChildren(node) {
+            const fragment = doc.createDocumentFragment();
+            Array.from(node.childNodes || []).forEach(child => {
+                if (child.nodeType === 3) {
+                    fragment.appendChild(doc.createTextNode(child.textContent || ''));
+                    return;
+                }
+
+                if (child.nodeType !== 1) {
+                    return;
+                }
+
+                const rawName = String(child.tagName || '').toLowerCase();
+                const tagName = allowedTags[rawName] || '';
+                if (!tagName) {
+                    fragment.appendChild(cleanChildren(child));
+                    return;
+                }
+
+                if (tagName === 'br') {
+                    fragment.appendChild(doc.createElement('br'));
+                    return;
+                }
+
+                const safeElement = doc.createElement(tagName);
+                safeElement.appendChild(cleanChildren(child));
+                fragment.appendChild(safeElement);
+            });
+            return fragment;
+        }
+
+        const output = doc.createElement('div');
+        output.appendChild(cleanChildren(template.content));
+        return output.innerHTML;
+    }
+
+    function htmlFragmentToPlainText(html, doc = document) {
+        const container = doc.createElement('div');
+        container.innerHTML = sanitizeWedaSafeHtmlFragment(html, doc);
+        const parts = [];
+
+        function walk(node) {
+            if (!node) return;
+            if (node.nodeType === 3) {
+                parts.push(node.textContent || '');
+                return;
+            }
+            if (node.nodeType !== 1) return;
+            if (String(node.tagName || '').toLowerCase() === 'br') {
+                parts.push('\n');
+                return;
+            }
+            Array.from(node.childNodes || []).forEach(walk);
+        }
+
+        Array.from(container.childNodes || []).forEach(walk);
+        return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    function placeCaretAtEnd(el) {
+        const doc = ownerDocumentOf(el);
+        const win = ownerWindowOf(el);
+        try {
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+            const selection = win.getSelection ? win.getSelection() : null;
+            if (selection) {
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function editorVisibleText(el) {
+        return normalizeSpaces(el && (el.innerText || el.textContent || ''));
+    }
+
+    function editorLooksChangedWithExpectedText(el, beforeText, expectedText) {
+        const before = normalizeSpaces(beforeText);
+        const after = editorVisibleText(el);
+        const expected = normalizeSpaces(expectedText);
+        if (after === before) return false;
+        if (after.length > before.length) return true;
+        if (!expected) return true;
+        const head = expected.slice(0, Math.min(180, expected.length));
+        const tail = expected.slice(Math.max(0, expected.length - 180));
+        return after.includes(head) || after.includes(tail);
+    }
+
+    function insertHtmlByCommand(el, html, plainText, beforeText) {
+        try {
+            const doc = ownerDocumentOf(el);
+            placeCaretAtEnd(el);
+            doc.execCommand('insertHTML', false, html);
+            return editorLooksChangedWithExpectedText(el, beforeText, plainText);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function pasteRichHtmlIntoContentEditable(el, html, plainText, beforeText) {
+        try {
+            const win = ownerWindowOf(el);
+            if (typeof win.DataTransfer !== 'function' || typeof win.ClipboardEvent !== 'function') return false;
+
+            const dataTransfer = new win.DataTransfer();
+            dataTransfer.setData('text/html', html);
+            dataTransfer.setData('text/plain', plainText);
+            placeCaretAtEnd(el);
+
+            const event = new win.ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dataTransfer
+            });
+
+            try {
+                if (!event.clipboardData) {
+                    Object.defineProperty(event, 'clipboardData', {
+                        value: dataTransfer
+                    });
+                }
+            } catch (_) {}
+
+            el.dispatchEvent(event);
+            return editorLooksChangedWithExpectedText(el, beforeText, plainText);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function appendFormattedHtmlDirectly(el, html) {
+        const doc = ownerDocumentOf(el);
+        const template = doc.createElement('template');
+        template.innerHTML = html;
+        el.appendChild(template.content.cloneNode(true));
+        return true;
+    }
+
+    function appendFormattedTextToContentEditable(el, text, html = '') {
         const doc = ownerDocumentOf(el);
         clearEmptyEditableHtml(el);
         const alreadyHasText = !editableTextIsEmpty(el);
-        if (alreadyHasText) {
-            el.appendChild(doc.createElement('br'));
-            el.appendChild(doc.createElement('br'));
+        const safeHtml = html ? sanitizeWedaSafeHtmlFragment(html, doc) : markdownToWedaSafeHtml(text);
+        const htmlToInsert = (alreadyHasText ? '<br><br>' : '') + safeHtml;
+        const plainText = (alreadyHasText ? '\n\n' : '') + (html ? htmlFragmentToPlainText(safeHtml, doc) : markdownInlineToPlainText(text));
+        const beforeText = editorVisibleText(el);
+
+        if (insertHtmlByCommand(el, htmlToInsert, plainText, beforeText)) {
+            logEvent('info', 'rich_html_inserted_command', 'Résultat HTML inséré par commande WEDA.', {
+                html_length: safeHtml.length,
+                text_length: plainText.length
+            });
+            return;
         }
 
-        const template = doc.createElement('template');
-        template.innerHTML = markdownToWedaSafeHtml(text);
-        el.appendChild(template.content.cloneNode(true));
+        if (pasteRichHtmlIntoContentEditable(el, htmlToInsert, plainText, beforeText)) {
+            logEvent('info', 'rich_html_inserted_paste', 'Résultat HTML inséré par événement paste WEDA.', {
+                html_length: safeHtml.length,
+                text_length: plainText.length
+            });
+            return;
+        }
+
+        appendFormattedHtmlDirectly(el, htmlToInsert);
+        logEvent('warning', 'rich_html_inserted_direct_fallback', 'Résultat HTML ajouté directement après refus des chemins collage.', {
+            html_length: safeHtml.length,
+            text_length: plainText.length
+        });
     }
 
     function appendPlainTextToContentEditable(el, text) {
@@ -3649,7 +4052,21 @@
         const InputEventCtor = win.InputEvent || window.InputEvent;
         try {
             if (InputEventCtor) {
-                el.dispatchEvent(new InputEventCtor('input', { bubbles: true, inputType: 'insertText', data: text }));
+                el.dispatchEvent(new InputEventCtor('beforeinput', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertFromPaste',
+                    data: text
+                }));
+            }
+        } catch (_) {}
+        try {
+            if (InputEventCtor) {
+                el.dispatchEvent(new InputEventCtor('input', {
+                    bubbles: true,
+                    inputType: 'insertFromPaste',
+                    data: text
+                }));
             } else {
                 el.dispatchEvent(new win.Event('input', { bubbles: true, cancelable: true }));
             }
@@ -3661,7 +4078,7 @@
         });
     }
 
-    function insertIntoTarget(targetInfo, text) {
+    function insertIntoTarget(targetInfo, text, html = '') {
         const target = targetInfo && targetInfo.element ? targetInfo.element : targetInfo;
         if (!target) return false;
 
@@ -3674,7 +4091,7 @@
         const contenteditable = hasContenteditable ? String(target.getAttribute('contenteditable') || '').toLowerCase() : '';
         if (target.isContentEditable || contenteditable === 'true' || (hasContenteditable && contenteditable === '')) {
             try {
-                appendFormattedTextToContentEditable(target, text);
+                appendFormattedTextToContentEditable(target, text, html);
             } catch (error) {
                 logEvent('warning', 'formatted_import_fallback', 'Import HTML formaté impossible, fallback texte brut.', {
                     error: error && error.message ? error.message : String(error)
@@ -3696,6 +4113,22 @@
         }
 
         return false;
+    }
+
+    function copyImportResultToClipboard(text, html = '') {
+        if (html) {
+            try {
+                GM_setClipboard(sanitizeWedaSafeHtmlFragment(html), 'html');
+                return 'html';
+            } catch (error) {
+                logEvent('warning', 'html_clipboard_fallback', 'Copie HTML refusée, fallback texte brut.', {
+                    error: error && error.message ? error.message : String(error)
+                });
+            }
+        }
+
+        GM_setClipboard(text, 'text');
+        return 'text';
     }
 
     function installEditableTracker() {
@@ -3740,6 +4173,7 @@
             return { inserted: false, reason: 'no_result', request: null };
         }
 
+        const resultHtml = String(request.result_html || request.resultHtml || '');
         if (request.patient_id && currentPatientId && !samePatient(request.patient_id, currentPatientId)) {
             logEvent('error', 'import_patient_mismatch', 'Import bloqué : patient différent.', {
                 request_id: request.id,
@@ -3812,7 +4246,7 @@
                 candidates: targetInfo.candidates || []
             });
 
-            const inserted = insertIntoTarget(targetInfo, request.result_text);
+            const inserted = insertIntoTarget(targetInfo, request.result_text, resultHtml);
             const medicoLegalResult = inserted
                 ? addMedicoLegalPhraseToClinicalExamField(targetInfo.element, { source, silent: !!(options && options.silent) })
                 : null;
@@ -3843,7 +4277,7 @@
                     source
                 });
             } else {
-                GM_setClipboard(request.result_text, 'text');
+                copyImportResultToClipboard(request.result_text, resultHtml);
             }
 
             await requestJson('POST', '/weda/import-status', {
@@ -3853,6 +4287,7 @@
                 page_url: location.href,
                 target: targetInfo.target,
                 target_reason: targetInfo.reason,
+                result_format: resultHtml ? 'html' : 'text',
                 medico_legal_clinical_exam: medicoLegalResult ? {
                     added: !!medicoLegalResult.added,
                     already_present: !!medicoLegalResult.alreadyPresent,
@@ -3892,6 +4327,7 @@
                 target: targetInfo.target,
                 target_reason: targetInfo.reason,
                 result_length: String(request.result_text || '').length,
+                result_html_length: resultHtml.length,
                 medicoLegalResult: medicoLegalResult ? {
                     added: !!medicoLegalResult.added,
                     alreadyPresent: !!medicoLegalResult.alreadyPresent,
@@ -4020,6 +4456,7 @@
                 enabled: !!settings.enabled,
                 start_key: normalizeShortcutName(settings.start_key || 'PageUp'),
                 stop_key: normalizeShortcutName(settings.stop_key || 'PageDown'),
+                document_now_key: normalizeShortcutName(settings.document_now_key || 'F8'),
                 auto_return_home: settings.auto_return_home !== false
             };
             const flySettings = appSettings.fly_dictation || {};
@@ -4134,6 +4571,115 @@
             ts: Date.now()
         });
         await continueConnectorPendingJob('stop_shortcut');
+    }
+
+    async function waitForConnectorDocumentNow(job) {
+        const waitStartedAt = Date.now();
+        while (Date.now() - waitStartedAt <= CONNECTOR_RESULT_TIMEOUT_MS) {
+            const response = await requestJson(
+                'GET',
+                '/connector/document-now/status?job_id=' + encodeURIComponent(job.id)
+            );
+            const serverJob = response.job || null;
+            if (!serverJob) {
+                await sleep(CONNECTOR_POLL_INTERVAL_MS);
+                continue;
+            }
+
+            if (serverJob.status === 'ready' && serverJob.clipboard_copied === true) {
+                showBadge('Document maintenant prêt à être collé : il est dans le presse-papiers.');
+                logEvent(
+                    'info',
+                    'connector_document_now_ready',
+                    'Document maintenant prêt à être collé.',
+                    {
+                        jobId: serverJob.id || job.id,
+                        resultLength: serverJob.result_length || 0,
+                        elapsedSeconds: serverJob.elapsed_seconds || 0
+                    }
+                );
+                return true;
+            }
+
+            if (serverJob.status === 'error' || serverJob.status === 'disabled') {
+                showBadge(
+                    serverJob.message || 'Document maintenant : génération ou copie impossible.',
+                    true
+                );
+                logEvent(
+                    'error',
+                    'connector_document_now_error',
+                    'Document maintenant non disponible.',
+                    {
+                        jobId: serverJob.id || job.id,
+                        status: serverJob.status || '',
+                        error: serverJob.error || serverJob.message || ''
+                    }
+                );
+                return false;
+            }
+
+            showBadge('Document maintenant : génération en cours dans DrFloW...');
+            await sleep(CONNECTOR_POLL_INTERVAL_MS);
+        }
+
+        showBadge('Document maintenant : délai dépassé. Vérifie DrFloW.', true);
+        logEvent(
+            'error',
+            'connector_document_now_timeout',
+            'Délai dépassé en attente de Document maintenant.',
+            { jobId: job.id || '' }
+        );
+        return false;
+    }
+
+    async function triggerConnectorDocumentNowWorkflow(trigger = 'shortcut') {
+        if (connectorDocumentNowBusy) {
+            showBadge('Document maintenant : une génération est déjà suivie.');
+            return;
+        }
+
+        connectorDocumentNowBusy = true;
+        try {
+            const settings = await refreshConnectorSettings();
+            if (!settings.enabled) {
+                showBadge('Connecteur WEDA désactivé dans l’application.', true);
+                return;
+            }
+
+            try {
+                await sendContext({
+                    source: 'connector_document_now',
+                    skipDelay: true,
+                    silent: true
+                });
+            } catch (error) {
+                logEvent(
+                    'warning',
+                    'connector_document_now_context_error',
+                    'Actualisation du contexte WEDA avant Document maintenant échouée.',
+                    { error: error && error.message ? error.message : String(error) }
+                );
+            }
+
+            const payload = connectorPayloadFromWeda(trigger);
+            showBadge('Document maintenant : création du snapshot...');
+            logEvent(
+                'info',
+                'connector_document_now_request',
+                'Déclenchement Document maintenant depuis WEDA.',
+                payload
+            );
+            const response = await requestJson('POST', '/connector/document-now', payload);
+            const job = response.job || {};
+            if (!job.id || job.status === 'error' || job.status === 'disabled') {
+                showBadge(job.message || 'Document maintenant : démarrage impossible.', true);
+                return;
+            }
+            await waitForConnectorDocumentNow(job);
+        } finally {
+            connectorDocumentNowBusy = false;
+        }
     }
 
     async function waitForConnectorResult(job) {
@@ -4310,7 +4856,8 @@
 
             const isStart = eventMatchesConnectorKey(event, connectorSettings.start_key);
             const isStop = eventMatchesConnectorKey(event, connectorSettings.stop_key);
-            if (!isStart && !isStop) return;
+            const isDocumentNow = eventMatchesConnectorKey(event, connectorSettings.document_now_key);
+            if (!isStart && !isStop && !isDocumentNow) return;
 
             const now = Date.now();
             if (now - connectorLastShortcutAt < CONNECTOR_SHORTCUT_COOLDOWN_MS) {
@@ -4322,15 +4869,22 @@
 
             event.preventDefault();
             event.stopPropagation();
-            const action = isStart ? 'start' : 'stop';
-            const trigger = `shortcut:${action}:${isStart ? connectorSettings.start_key : connectorSettings.stop_key}`;
+            const action = isStart ? 'start' : (isStop ? 'stop' : 'document_now');
+            const shortcutKey = isStart
+                ? connectorSettings.start_key
+                : (isStop ? connectorSettings.stop_key : connectorSettings.document_now_key);
+            const trigger = `shortcut:${action}:${shortcutKey}`;
             logEvent('info', 'connector_shortcut', 'Raccourci connecteur WEDA détecté.', {
                 action,
                 trigger
             });
 
             Promise.resolve()
-                .then(() => isStart ? startConnectorWorkflow(trigger) : stopConnectorWorkflow(trigger))
+                .then(() => {
+                    if (isStart) return startConnectorWorkflow(trigger);
+                    if (isStop) return stopConnectorWorkflow(trigger);
+                    return triggerConnectorDocumentNowWorkflow(trigger);
+                })
                 .catch(error => {
                     logEvent('error', 'connector_shortcut_error', 'Erreur raccourci connecteur.', {
                         action,
@@ -4675,6 +5229,8 @@
     installFlyDictationShortcutHandler();
     refreshConnectorSettings();
     setInterval(refreshConnectorSettings, CONNECTOR_SETTINGS_REFRESH_MS);
+    pollWedaContextRefreshRequest();
+    setInterval(pollWedaContextRefreshRequest, CONTEXT_REFRESH_POLL_MS);
     setTimeout(() => continueConnectorPendingJob('load'), 600);
     setInterval(() => continueConnectorPendingJob('poll'), CONNECTOR_POLL_INTERVAL_MS);
 })();

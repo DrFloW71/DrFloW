@@ -1,11 +1,11 @@
 {
   "whisper": {
     "default_model": "large-v3",
-    "device": "cpu",
-    "compute_type": "int8",
+    "device": "cuda",
+    "compute_type": "float16",
     "language": "fr",
-    "segment_seconds": 15,
-    "overlap_seconds": 1,
+    "segment_seconds": 30,
+    "overlap_seconds": 2,
     "sample_rate": 16000,
     "input_device": "",
     "cpu_threads": 16,
@@ -17,7 +17,7 @@
     "force_language": true,
     "disable_language_detection": true,
     "condition_on_previous_text": false,
-    "initial_prompt": "Consultation de médecine générale en français.",
+    "initial_prompt": "Consultation de médecine générale en français entre un médecin et un patient. Transcription fidèle du dialogue médical : symptômes, évolution, négations, antécédents, traitements, posologies, allergies, examen clinique, résultats biologiques, dates, valeurs numériques et conseils donnés.",
     "initial_prompt_name": "Médical général"
   },
   "stt": {
@@ -30,19 +30,24 @@
       "SPEAKER_00": "Médecin",
       "SPEAKER_01": "Patient"
     },
-    "stt_context_bias": "HTA, diabète de type 2, fibrillation auriculaire, insuffisance cardiaque, Eliquis, Kardégic, metformine, Forxiga, Ozempic, HbA1c, DFG, BNP, SpO2."
+    "stt_context_bias": "HTA, diabète de type 2, fibrillation auriculaire, insuffisance cardiaque, Eliquis, Kardégic, metformine, Forxiga, Ozempic, HbA1c, DFG, BNP, SpO2.",
+    "benchmark_engines": {
+      "faster-whisper": true,
+      "qwen3_asr": false,
+      "voxtral": false
+    }
   },
   "faster_whisper": {
     "enabled": true,
     "model": "large-v3",
-    "device": "cpu",
-    "compute_type": "int8",
+    "device": "cuda",
+    "compute_type": "float16",
     "language": "fr",
     "task": "transcribe",
     "force_language": true,
     "disable_language_detection": true,
-    "segment_seconds": 15,
-    "overlap_seconds": 1,
+    "segment_seconds": 30,
+    "overlap_seconds": 2,
     "temperature": 0.0,
     "beam_size": 5,
     "vad_filter": true,
@@ -56,7 +61,8 @@
     "no_speech_threshold": 0.6,
     "log_prob_threshold": -1.0,
     "compression_ratio_threshold": 2.4,
-    "initial_prompt": "Consultation de médecine générale en français. Vocabulaire possible : médecin, patient, symptômes, traitements, posologies, tension artérielle, saturation, température, douleur, fièvre, toux, dyspnée, diarrhée, vomissements, HTA, diabète, ECG, CRP, HbA1c, DFG, SpO2."
+    "initial_prompt": "Consultation de médecine générale en français entre un médecin et un patient. Transcription fidèle du dialogue médical : symptômes, évolution, négations, antécédents, traitements, posologies, allergies, examen clinique, résultats biologiques, dates, valeurs numériques et conseils donnés.",
+    "input_device": ""
   },
   "audio_filter": {
     "enabled": true,
@@ -133,11 +139,26 @@
     "show_sent_message": true,
     "show_weda_context": true,
     "save_history": true,
-    "window_width": 1921,
-    "window_height": 1039
+    "window_width": 2368,
+    "window_height": 1133,
+    "last_prompt_id": "2dd6aa6310e14f0a8a33cd3a0ad74bd3",
+    "result_destination": "PDF structuré",
+    "main_notebook_tab_order": [
+      "Contexte WEDA",
+      "Transcription",
+      "Document 1",
+      "Document 2",
+      "Document 3",
+      "Document maintenant",
+      "PDF structurés",
+      "Abréviations",
+      "Prompt Whisper",
+      "Logs",
+      "Moteur de transcription"
+    ]
   },
   "weda": {
-    "context_capture_delay_seconds": 20
+    "context_capture_delay_seconds": 60
   },
   "pdf": {
     "templates_dir": "data/pdf_templates",
@@ -147,11 +168,14 @@
     "allow_pdf_without_fields": false,
     "default_prompt_id": "pdf_form_fill",
     "preferred_source": "Contexte + transcription",
-    "max_tokens": 8192
+    "max_tokens": 8192,
+    "last_template_id": "mdph_v6",
+    "last_prompt_id": "b967c4afa4604914ad35e05c46a24e7d"
   },
   "secondary_analysis": {
-    "enabled": false,
+    "enabled": true,
     "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184",
+    "last_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184",
     "auto_run_after_primary": true,
     "include_transcription": true,
     "include_weda_context": true,
@@ -160,8 +184,9 @@
     "allow_manual_run": true
   },
   "tertiary_analysis": {
-    "enabled": false,
-    "default_prompt_id": "5474267cf94c4c71bfc13708af00cc14",
+    "enabled": true,
+    "default_prompt_id": "19452c95da5c426eac6e4127b1f60d0c",
+    "last_prompt_id": "19452c95da5c426eac6e4127b1f60d0c",
     "auto_run_after_secondary": true,
     "include_transcription": true,
     "include_weda_context": true,
@@ -171,7 +196,9 @@
     "allow_manual_run": true
   },
   "document_now": {
-    "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184"
+    "default_prompt_id": "eec963b3c81f4f4a8e73194c7fa69184",
+    "last_prompt_id": "19452c95da5c426eac6e4127b1f60d0c",
+    "default_prompt_prefix": ""
   },
   "abbreviations": {
     "include_in_lmstudio_prompt": true
@@ -200,12 +227,14 @@
     "semi_streaming_tail_overlap_seconds": 0.25,
     "semi_streaming_reuse_tail_seconds": 0.12,
     "semi_streaming_wait_ms": 150,
-    "semi_streaming_empty_fallback_wait_ms": 4500
+    "semi_streaming_empty_fallback_wait_ms": 4500,
+    "max_new_tokens": 128
   },
   "connector": {
     "enabled": true,
     "start_key": "Home",
     "stop_key": "End",
+    "document_now_key": "Insert",
     "stop_transcription_grace_seconds": 2,
     "auto_return_home": true
   },
@@ -214,5 +243,25 @@
     "require_manual_validation_before_lmstudio": true,
     "require_manual_validation_before_weda_import": true,
     "block_import_if_patient_changed": true
+  },
+  "medical_transcription": {
+    "include_weda_context_in_whisper_prompt": true,
+    "use_dynamic_weda_hotwords": true,
+    "apply_validated_corrections": false,
+    "max_dynamic_prompt_characters": 800,
+    "max_hotwords": 80,
+    "max_hotword_length": 60,
+    "max_hotwords_characters": 2000,
+    "min_validations_for_automatic_correction": 3,
+    "permanent_hotwords": [
+      "hémoglobine glyquée",
+      "NT-proBNP",
+      "microalbuminurie",
+      "créatininémie",
+      "automesure tensionnelle",
+      "anticoagulant",
+      "frottis cervico-utérin",
+      "auscultation cardio-pulmonaire"
+    ]
   }
 }

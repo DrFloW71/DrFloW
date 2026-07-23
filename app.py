@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import re
@@ -11,15 +12,33 @@ import tkinter as tk
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 from audio_recorder import AudioRecorder, PushToTalkRecorder, list_input_devices
-from clipboard_tools import copy_text_to_clipboard
+from clipboard_tools import clear_text_clipboard, copy_rich_text_to_clipboard, copy_text_to_clipboard, read_text_from_clipboard
 from debug_logger import DebugLogger
+from diagnostic_manager import run_drflow_diagnostics, sanitized_diagnostic_report
 from history_manager import HistoryManager
-from lmstudio_client import LmStudioClient
+from lmstudio_client import LmStudioCancelled, LmStudioClient, fetch_lmstudio_model_context
 from local_server import LocalServer
+from patient_safety import (
+    PATIENT_SAFETY_BLOCKED,
+    PATIENT_SAFETY_OK,
+    evaluate_patient_context,
+    normalize_patient_id,
+    patient_ids_match,
+)
 from pdf_export_manager import PdfExportManager
 from pdf_fill_manager import PdfFillManager
 from pdf_schema_builder import (
@@ -31,6 +50,8 @@ from pdf_schema_builder import (
 )
 from pdf_template_manager import PdfTemplateManager
 from prompt_manager import PromptManager
+from prompt_quality import PromptVersionStore, QualityMetricsStore, content_hash, unified_text_diff
+from rich_text_formatter import RichTextPayload, combine_weda_rich_text_payloads, format_weda_rich_text
 from secondary_analysis import (
     DEFAULT_SECONDARY_ANALYSIS_CONFIG,
     DEFAULT_SECONDARY_ANALYSIS_PROMPT,
@@ -49,6 +70,21 @@ from secondary_analysis import (
     normalize_tertiary_analysis_config,
 )
 from segment_manager import SegmentedDictationSession
+from medical_transcription import (
+    DEFAULT_MEDICAL_WHISPER_PROMPT,
+    DEFAULT_PERMANENT_MEDICAL_HOTWORDS,
+    MAX_DYNAMIC_PROMPT_CHARACTERS,
+    MAX_HOTWORDS,
+    MAX_HOTWORDS_CHARACTERS,
+    MAX_HOTWORD_LENGTH,
+    MIN_VALIDATIONS_FOR_AUTOMATIC_CORRECTION,
+    TRANSCRIPTION_OVERLAP_SECONDS,
+    TRANSCRIPTION_WINDOW_SECONDS,
+    build_dynamic_whisper_prompt,
+    build_hotword_bundle,
+    parse_permanent_hotwords,
+)
+from progressive_transcription import deduplicate_transcription_overlap
 from stt_engine_manager import (
     FASTER_WHISPER_ENGINE_ID,
     QWEN3_ASR_ENGINE_ID,
@@ -64,7 +100,9 @@ from stt_engine_manager import (
     normalize_engine_id,
 )
 from transcriber import Transcriber
-from transcription_cleaner import WHISPER_MEDICAL_INITIAL_PROMPT, clean_transcription_text
+from transcription_cleaner import clean_transcription_text
+from transcription_draft import TranscriptionDraftStore
+from transcription_corrections import CorrectionStore, format_correction_review, propose_corrections
 from weda_context_manager import WedaContextManager
 from weda_import_manager import WedaImportManager
 from whisper_model_manager import WhisperModelManager, WhisperSettings, canonical_french_whisper_model_name
@@ -74,12 +112,29 @@ BASE_DIR = Path(__file__).resolve().parent
 APP_NAME = "DrFloW"
 APP_SUBTITLE = "Assistant local de consultation médicale :)"
 APP_WINDOW_TITLE = f"{APP_NAME} - {APP_SUBTITLE}"
-DEFAULT_WHISPER_INITIAL_PROMPT = WHISPER_MEDICAL_INITIAL_PROMPT
+DEFAULT_WHISPER_INITIAL_PROMPT = DEFAULT_MEDICAL_WHISPER_PROMPT
 ABBREVIATIONS_PATH = BASE_DIR / "abbreviations.csv"
 MESSAGE_ATTACHMENT_MAX_CHARS_PER_FILE = 30000
 MESSAGE_ATTACHMENT_MAX_TOTAL_CHARS = 90000
 LMSTUDIO_MAIN_SPINNER_KEY = "main"
+LMSTUDIO_RESULT_RETRY_SPINNER_KEY = "main_retry"
+LMSTUDIO_SECONDARY_RETRY_SPINNER_KEY = "secondary_retry"
+LMSTUDIO_TERTIARY_RETRY_SPINNER_KEY = "tertiary_retry"
+PDF_FILL_SPINNER_KEY = "pdf_fill"
 LMSTUDIO_SPINNER_FRAMES = ("◐", "◓", "◑", "◒")
+LMSTUDIO_CONTEXT_ESTIMATED_CHARS_PER_TOKEN = 3.0
+LMSTUDIO_CONTEXT_SAFETY_MARGIN_TOKENS = 512
+LMSTUDIO_CONTEXT_RESPONSE_RESERVE_TOKENS = 2048
+LMSTUDIO_CONTEXT_MIN_INPUT_TOKENS = 512
+TEXT_SEARCH_MATCH_TAG = "drflow_search_match"
+TEXT_SEARCH_CURRENT_TAG = "drflow_search_current"
+LEGACY_TRANSCRIPTION_TAB_LABELS = {
+    "Transcription brute Whisper",
+    "Transcription corrigée localement",
+}
+DICTATION_TRANSCRIPTION_FLUSH_TIMEOUT_SECONDS = 180.0
+FLY_DICTATION_CLIPBOARD_RESTORE_DELAY_MS = 150
+WEDA_CONTEXT_REFRESH_TIMEOUT_MS = 30000
 MESSAGE_ATTACHMENT_TEXT_SUFFIXES = {
     ".csv",
     ".json",
@@ -104,6 +159,30 @@ DEFAULT_MESSAGE_COMPOSITION_CONFIG = {
     "include_weda_context": True,
     "include_transcription": True,
 }
+DEFAULT_MEDICAL_TRANSCRIPTION_CONFIG = {
+    "include_weda_context_in_whisper_prompt": True,
+    "use_dynamic_weda_hotwords": True,
+    "apply_validated_corrections": False,
+    "max_dynamic_prompt_characters": MAX_DYNAMIC_PROMPT_CHARACTERS,
+    "max_hotwords": MAX_HOTWORDS,
+    "max_hotword_length": MAX_HOTWORD_LENGTH,
+    "max_hotwords_characters": MAX_HOTWORDS_CHARACTERS,
+    "min_validations_for_automatic_correction": MIN_VALIDATIONS_FOR_AUTOMATIC_CORRECTION,
+    "permanent_hotwords": list(DEFAULT_PERMANENT_MEDICAL_HOTWORDS),
+}
+
+
+def migrate_main_notebook_tab_order(labels) -> list[str]:
+    migrated_order = []
+    for label in labels:
+        normalized_label = str(label)
+        if normalized_label in LEGACY_TRANSCRIPTION_TAB_LABELS:
+            normalized_label = "Transcription"
+        if normalized_label not in migrated_order:
+            migrated_order.append(normalized_label)
+    return migrated_order
+
+
 DEFAULT_PDF_FORM_FILL_PROMPT = """Tu dois remplir au mieux les champs d’un PDF médical structuré à partir des seules informations disponibles.
 
 Objectif :
@@ -145,6 +224,7 @@ CONTEXTE WEDA :
 
 SNAPSHOT DE TRANSCRIPTION :
 {{snapshot_transcription}}"""
+DEFAULT_DOCUMENT_NOW_PROMPT_PREFIX = ""
 PDF_SOURCE_CHOICES = (
     "Contexte + transcription",
     "Transcription seule",
@@ -154,6 +234,38 @@ PDF_SOURCE_CHOICES = (
     "Document maintenant",
     "Résultat 1 + Résultat 2",
     "Résultat 1 + Résultat 2 + Résultat 3",
+)
+RESULT_DESTINATION_CHOICES = (
+    "WEDA consultation",
+    "WEDA courrier",
+    "Presse-papiers",
+    "PDF structuré",
+)
+RICH_RESULT_BOLD_TAG = "drflow_rich_bold"
+RICH_RESULT_UNDERLINE_TAG = "drflow_rich_underline"
+RICH_RESULT_ITALIC_TAG = "drflow_rich_italic"
+RICH_RESULT_STRIKE_TAG = "drflow_rich_strike"
+RICH_RESULT_TK_TAGS = (
+    RICH_RESULT_BOLD_TAG,
+    RICH_RESULT_UNDERLINE_TAG,
+    RICH_RESULT_ITALIC_TAG,
+    RICH_RESULT_STRIKE_TAG,
+)
+RICH_RESULT_HTML_TO_TK_TAG = {
+    "strong": RICH_RESULT_BOLD_TAG,
+    "b": RICH_RESULT_BOLD_TAG,
+    "u": RICH_RESULT_UNDERLINE_TAG,
+    "em": RICH_RESULT_ITALIC_TAG,
+    "i": RICH_RESULT_ITALIC_TAG,
+    "s": RICH_RESULT_STRIKE_TAG,
+    "strike": RICH_RESULT_STRIKE_TAG,
+    "del": RICH_RESULT_STRIKE_TAG,
+}
+RICH_RESULT_TK_TAG_TO_HTML = (
+    (RICH_RESULT_BOLD_TAG, "strong"),
+    (RICH_RESULT_UNDERLINE_TAG, "u"),
+    (RICH_RESULT_ITALIC_TAG, "em"),
+    (RICH_RESULT_STRIKE_TAG, "s"),
 )
 WHISPER_MODEL_CHOICES = (
     "tiny",
@@ -202,6 +314,44 @@ MATERIAL_DARK_THEME = {
     "danger": "#f87171",
     "danger_container": "#6f1d2a",
 }
+
+
+class RichHtmlToTkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.active_tags: list[str] = []
+        self.segments: list[tuple[str, tuple[str, ...]]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        name = tag.lower()
+        if name == "br":
+            self._append_text("\n")
+            return
+
+        mapped = RICH_RESULT_HTML_TO_TK_TAG.get(name)
+        if mapped:
+            self.active_tags.append(mapped)
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if tag.lower() == "br":
+            self._append_text("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        mapped = RICH_RESULT_HTML_TO_TK_TAG.get(tag.lower())
+        if not mapped:
+            return
+
+        for index in range(len(self.active_tags) - 1, -1, -1):
+            if self.active_tags[index] == mapped:
+                del self.active_tags[index]
+                break
+
+    def handle_data(self, data: str) -> None:
+        self._append_text(data)
+
+    def _append_text(self, value: str) -> None:
+        if value:
+            self.segments.append((value, tuple(dict.fromkeys(self.active_tags))))
 
 
 def load_json(path: Path, fallback: dict | list):
@@ -365,6 +515,7 @@ class AssistantApp:
         self.main_thread_id = threading.get_ident()
         self.config = load_json(BASE_DIR / "config.json", {})
         self.ensure_stt_config()
+        self.ensure_medical_transcription_config()
         self.ensure_message_composition_config()
         self.ensure_pdf_config()
         self.ensure_secondary_analysis_config()
@@ -372,24 +523,42 @@ class AssistantApp:
         self.root.geometry(self.get_saved_window_geometry())
         self.configure_material_theme()
         self.data_dir = BASE_DIR / "data"
-        self.prompt_manager = PromptManager(BASE_DIR / "prompts.json")
+        self.prompt_version_store = PromptVersionStore(self.data_dir / "prompt_versions.jsonl")
+        self.quality_metrics_store = QualityMetricsStore(self.data_dir / "quality_metrics.jsonl")
+
+        def version_callback(action, prompt):
+            self.prompt_version_store.record(prompt, source=action)
+
+        self.prompt_manager = PromptManager(BASE_DIR / "prompts.json", on_change=version_callback)
         self.ensure_pdf_form_fill_prompt()
         self.ensure_secondary_analysis_prompt()
         self.ensure_tertiary_analysis_prompt()
         self.ensure_document_now_prompt()
-        self.whisper_initial_prompt_manager = PromptManager(BASE_DIR / "whisper_initial_prompts.json")
+        self.whisper_initial_prompt_manager = PromptManager(
+            BASE_DIR / "whisper_initial_prompts.json",
+            on_change=version_callback,
+        )
         self.ensure_whisper_initial_prompts()
+        self.prompt_version_store.snapshot(self.prompt_manager.list_prompts(), source="startup")
+        self.prompt_version_store.snapshot(self.whisper_initial_prompt_manager.list_prompts(), source="startup_whisper")
         pdf_config = self.config.get("pdf", {})
         self.pdf_template_manager = PdfTemplateManager(self.resolve_app_path(pdf_config.get("templates_dir"), "data/pdf_templates"))
         self.pdf_fill_manager = PdfFillManager()
         self.pdf_export_manager = PdfExportManager(self.resolve_app_path(pdf_config.get("outputs_dir"), "data/pdf_outputs"))
         self.context_manager = WedaContextManager(self.data_dir / "weda_context.json")
         self.import_manager = WedaImportManager(self.data_dir / "import_request.json")
+        self.rich_result_payloads: dict[str, RichTextPayload] = {}
+        self.result_patient_bindings: dict[str, dict] = {}
+        self.pending_result_patient_bindings: dict[str, dict] = {}
+        self.generated_result_originals: dict[str, str] = {}
+        self.result_generation_metadata: dict[str, dict] = {}
         self.debug_logger = DebugLogger(self.data_dir / "debug.log.jsonl")
         self.history_manager = HistoryManager(
             self.data_dir / "history.jsonl",
             enabled=bool(self.config.get("ui", {}).get("save_history", True)),
         )
+        self.transcription_draft_store = TranscriptionDraftStore(self.data_dir / "last_transcription.json")
+        self.correction_store = CorrectionStore(self.data_dir / "transcription_corrections.json")
         self.model_manager = WhisperModelManager()
         self.stt_engine_manager = STTEngineManager(self.model_manager)
         self.transcriber = Transcriber(self.model_manager, self.get_stt_settings, stt_manager=self.stt_engine_manager)
@@ -418,17 +587,41 @@ class AssistantApp:
         self.document_now_snapshots: dict[str, DocumentNowSnapshot] = {}
         self.document_now_current_snapshot: DocumentNowSnapshot | None = None
         self.document_now_pending_checkpoints: dict[str, dict] = {}
+        self._weda_context_refresh_lock = threading.Lock()
+        self.weda_context_refresh_job: dict | None = None
+        self._document_now_connector_lock = threading.Lock()
+        self.document_now_connector_job: dict | None = None
         self._connector_lock = threading.Lock()
         self.connector_job: dict | None = None
         self.dictation_run_id = 0
         self._recording_indicator_active = False
         self._recording_indicator_source = ""
+        self.tray_icon = None
+        self.tray_thread: threading.Thread | None = None
+        self.tray_hidden = False
+        self.tray_available = False
+        self.tray_images: dict[str, object] = {}
+        self._closing = False
         self.last_stt_result: dict = {}
+        self.last_whisper_diagnostics: dict = {}
+        self.pending_transcription_corrections = []
         self.last_stt_audio_path = ""
         self.stt_benchmark_results: list[dict] = []
         self.lmstudio_spinner_vars: dict[str, tk.StringVar] = {}
         self.lmstudio_spinner_jobs: dict[str, str] = {}
         self.lmstudio_spinner_frame_indexes: dict[str, int] = {}
+        self.lmstudio_context_window_tokens = 0
+        self.lmstudio_context_window_model = ""
+        self.lmstudio_context_window_source = ""
+        self.active_lmstudio_requests: dict[str, dict] = {}
+        self._active_lmstudio_requests_lock = threading.Lock()
+        self._lmstudio_progress_job = None
+        self.diagnostic_window: tk.Toplevel | None = None
+        self.quality_window: tk.Toplevel | None = None
+        self._main_notebook_drag_index: int | None = None
+        self._main_notebook_drag_active = False
+        self._main_notebook_drag_start_x = 0
+        self._main_notebook_drag_start_y = 0
 
         whisper_config = self.config.get("whisper", {})
         stt_config = self.config.get("stt", {})
@@ -437,6 +630,15 @@ class AssistantApp:
         connector_config = self.config.get("connector", {})
         fly_dictation_config = self.config.get("fly_dictation", {})
         message_composition_config = self.config.get("message_composition", {})
+        benchmark_engines_config = stt_config.get("benchmark_engines", {})
+        if not isinstance(benchmark_engines_config, dict):
+            benchmark_engines_config = {}
+        result_destination = str(self.config.get("ui", {}).get("result_destination") or "WEDA consultation")
+        if result_destination not in RESULT_DESTINATION_CHOICES:
+            result_destination = "WEDA consultation"
+        pdf_source = str(self.config.get("pdf", {}).get("preferred_source") or "Résultat 1 + Résultat 2")
+        if pdf_source not in PDF_SOURCE_CHOICES:
+            pdf_source = "Résultat 1 + Résultat 2"
         self.model_var = tk.StringVar(
             value=canonical_french_whisper_model_name(whisper_config.get("default_model") or "medium")
         )
@@ -452,9 +654,9 @@ class AssistantApp:
         self.stt_keep_audio_var = tk.BooleanVar(value=bool(stt_config.get("keep_audio_for_benchmark", False)))
         self.stt_auto_fallback_var = tk.BooleanVar(value=bool(stt_config.get("auto_fallback_to_faster_whisper", True)))
         self.stt_show_warnings_var = tk.BooleanVar(value=bool(stt_config.get("show_engine_warnings", True)))
-        self.stt_compare_faster_var = tk.BooleanVar(value=True)
-        self.stt_compare_qwen_var = tk.BooleanVar(value=False)
-        self.stt_compare_voxtral_var = tk.BooleanVar(value=False)
+        self.stt_compare_faster_var = tk.BooleanVar(value=bool(benchmark_engines_config.get(FASTER_WHISPER_ENGINE_ID, True)))
+        self.stt_compare_qwen_var = tk.BooleanVar(value=bool(benchmark_engines_config.get(QWEN3_ASR_ENGINE_ID, False)))
+        self.stt_compare_voxtral_var = tk.BooleanVar(value=bool(benchmark_engines_config.get(VOXTRAL_ENGINE_ID, False)))
         self.micro_device_options = list_input_devices()
         self.micro_device_values = {label: value for label, value in self.micro_device_options}
         self.micro_device_var = tk.StringVar(
@@ -469,6 +671,16 @@ class AssistantApp:
         self.tertiary_prompt_var = tk.StringVar(value="")
         self.document_now_prompt_var = tk.StringVar(value="")
         self.whisper_initial_prompt_var = tk.StringVar(value="")
+        medical_transcription_config = self.config.get("medical_transcription", {})
+        self.whisper_include_weda_context_var = tk.BooleanVar(
+            value=bool(medical_transcription_config.get("include_weda_context_in_whisper_prompt", True))
+        )
+        self.whisper_use_dynamic_hotwords_var = tk.BooleanVar(
+            value=bool(medical_transcription_config.get("use_dynamic_weda_hotwords", True))
+        )
+        self.whisper_apply_corrections_var = tk.BooleanVar(
+            value=bool(medical_transcription_config.get("apply_validated_corrections", False))
+        )
         self.include_prompt_var = tk.BooleanVar(value=bool(message_composition_config.get("include_prompt", True)))
         self.include_context_var = tk.BooleanVar(value=bool(message_composition_config.get("include_weda_context", True)))
         self.include_transcription_var = tk.BooleanVar(
@@ -478,6 +690,9 @@ class AssistantApp:
         self.connector_enabled_var = tk.BooleanVar(value=bool(connector_config.get("enabled", False)))
         self.connector_start_key_var = tk.StringVar(value=str(connector_config.get("start_key") or "PageUp"))
         self.connector_stop_key_var = tk.StringVar(value=str(connector_config.get("stop_key") or "PageDown"))
+        self.connector_document_now_key_var = tk.StringVar(
+            value=str(connector_config.get("document_now_key") or "F8")
+        )
         self.fly_dictation_enabled_var = tk.BooleanVar(value=bool(fly_dictation_config.get("enabled", True)))
         self.fly_dictation_key_var = tk.StringVar(value=str(fly_dictation_config.get("key") or "²"))
         self.fly_dictation_model_var = tk.StringVar(
@@ -494,10 +709,10 @@ class AssistantApp:
         self.fly_dictation_compute_var = tk.StringVar(
             value=str(fly_dictation_config.get("compute_type") or whisper_config.get("compute_type") or "int8")
         )
-        self.result_destination_var = tk.StringVar(value="WEDA consultation")
+        self.result_destination_var = tk.StringVar(value=result_destination)
         self.pdf_template_var = tk.StringVar(value="")
         self.pdf_prompt_var = tk.StringVar(value="")
-        self.pdf_source_var = tk.StringVar(value=str(self.config.get("pdf", {}).get("preferred_source") or "Résultat 1 + Résultat 2"))
+        self.pdf_source_var = tk.StringVar(value=pdf_source)
         self.pdf_field_name_var = tk.StringVar(value="")
         self.pdf_field_label_var = tk.StringVar(value="")
         self.pdf_field_description_var = tk.StringVar(value="")
@@ -525,11 +740,19 @@ class AssistantApp:
         self.message_attachment_status_var = tk.StringVar(value="Fichiers: aucun")
         self.fly_dictation_status_var = tk.StringVar(value="Volée: initialisation")
         self.lmstudio_status_var = tk.StringVar(value="LM Studio: prêt")
+        self.lmstudio_progress_var = tk.StringVar(value="")
         self.weda_patient_status_var = tk.StringVar(value="Patient WEDA: non reçu")
+        self.patient_safety_title_var = tk.StringVar(value="Aucun dossier WEDA verrouillé")
+        self.patient_safety_detail_var = tk.StringVar(value="Récupère le contexte patient avant génération ou import WEDA.")
         self.import_status_var = tk.StringVar(value="Import WEDA: aucun")
         self.server_status_var = tk.StringVar(value="Serveur local: arrêté")
         self.log_status_var = tk.StringVar(value="Logs: prêts")
         self.pdf_status_var = tk.StringVar(value="PDF: aucun modèle")
+        self.text_search_window: tk.Toplevel | None = None
+        self.text_search_query_var = tk.StringVar(value="")
+        self.text_search_status_var = tk.StringVar(value="Recherche prête")
+        self.text_search_matches: list[tuple[tk.Text, str, str]] = []
+        self.text_search_current_index = -1
 
         self._fly_dictation_lock = threading.Lock()
         self._fly_dictation_key_down = False
@@ -542,7 +765,10 @@ class AssistantApp:
         self._fly_cuda_runtime_failed = False
 
         self._build_ui()
+        self.install_text_search_shortcuts()
+        self.setup_tray_icon()
         self.install_live_message_refresh()
+        self.restore_last_transcription()
         self._refresh_prompt_combo()
         self._refresh_secondary_prompt_combo()
         self._refresh_tertiary_prompt_combo()
@@ -555,7 +781,9 @@ class AssistantApp:
         self.start_server()
         self.install_fly_dictation_hotkey()
         self.preload_fly_dictation_model()
+        self.refresh_lmstudio_context_window_async()
         self.root.bind("<Configure>", self.on_root_configure, add="+")
+        self.root.bind("<Unmap>", self.on_root_unmap, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def configure_material_theme(self) -> None:
@@ -809,6 +1037,301 @@ class AssistantApp:
         if var is not None:
             var.set("")
 
+    def launch_lmstudio_request(
+        self,
+        key: str,
+        client: LmStudioClient,
+        message: str,
+        *,
+        on_success,
+        on_error,
+        thread_name: str,
+        response_format: dict | None = None,
+        result_source: str = "",
+    ) -> bool:
+        request_id = uuid.uuid4().hex
+        stop_event = threading.Event()
+        with self._active_lmstudio_requests_lock:
+            existing = self.active_lmstudio_requests.get(key)
+            if existing and not existing["stop_event"].is_set():
+                self.lmstudio_status_var.set(f"LM Studio: {key} déjà en cours")
+                return False
+            self.active_lmstudio_requests[key] = {
+                "request_id": request_id,
+                "stop_event": stop_event,
+                "started_at": time.monotonic(),
+                "progress_chars": 0,
+                "cancelling": False,
+            }
+        if result_source:
+            self.capture_pending_result_patient_binding(result_source)
+        self.update_lmstudio_request_controls()
+
+        def progress(_elapsed: float, chars: int) -> None:
+            with self._active_lmstudio_requests_lock:
+                current = self.active_lmstudio_requests.get(key)
+                if current and current.get("request_id") == request_id:
+                    current["progress_chars"] = max(0, int(chars or 0))
+
+        def worker():
+            try:
+                response = client.chat(
+                    message,
+                    stop_event=stop_event,
+                    response_format=response_format,
+                    on_progress=progress,
+                )
+                self.root.after(0, self.finish_lmstudio_request, key, request_id, on_success, response, None)
+            except Exception as exc:
+                self.root.after(0, self.finish_lmstudio_request, key, request_id, on_error, None, exc)
+
+        threading.Thread(target=worker, name=thread_name, daemon=True).start()
+        return True
+
+    def is_lmstudio_request_active(self, key: str) -> bool:
+        with self._active_lmstudio_requests_lock:
+            request = self.active_lmstudio_requests.get(key)
+            return bool(request and not request["stop_event"].is_set())
+
+    def finish_lmstudio_request(self, key: str, request_id: str, callback, response, error) -> None:
+        with self._active_lmstudio_requests_lock:
+            current = self.active_lmstudio_requests.get(key)
+            if not current or current.get("request_id") != request_id:
+                return
+            self.active_lmstudio_requests.pop(key, None)
+        self.update_lmstudio_request_controls()
+        if error is not None:
+            callback(error)
+        else:
+            callback(response)
+
+    def chat_lmstudio_managed_blocking(self, key: str, client: LmStudioClient, message: str):
+        request_id = uuid.uuid4().hex
+        stop_event = threading.Event()
+        with self._active_lmstudio_requests_lock:
+            if key in self.active_lmstudio_requests:
+                raise RuntimeError(f"Génération {key} déjà en cours.")
+            self.active_lmstudio_requests[key] = {
+                "request_id": request_id,
+                "stop_event": stop_event,
+                "started_at": time.monotonic(),
+                "progress_chars": 0,
+                "cancelling": False,
+            }
+        self.root.after(0, self.update_lmstudio_request_controls)
+
+        def progress(_elapsed: float, chars: int) -> None:
+            with self._active_lmstudio_requests_lock:
+                current = self.active_lmstudio_requests.get(key)
+                if current and current.get("request_id") == request_id:
+                    current["progress_chars"] = max(0, int(chars or 0))
+
+        try:
+            return client.chat(message, stop_event=stop_event, on_progress=progress)
+        finally:
+            self.root.after(0, self.finish_lmstudio_tracking, key, request_id)
+
+    def finish_lmstudio_tracking(self, key: str, request_id: str) -> None:
+        with self._active_lmstudio_requests_lock:
+            current = self.active_lmstudio_requests.get(key)
+            if current and current.get("request_id") == request_id:
+                self.active_lmstudio_requests.pop(key, None)
+        self.update_lmstudio_request_controls()
+
+    def cancel_all_lmstudio_requests(self) -> None:
+        with self._active_lmstudio_requests_lock:
+            active = list(self.active_lmstudio_requests.values())
+            for request in active:
+                request["cancelling"] = True
+                request["stop_event"].set()
+        if active:
+            self.lmstudio_status_var.set(f"LM Studio: annulation demandée ({len(active)})")
+        self.update_lmstudio_request_controls()
+
+    def update_lmstudio_request_controls(self) -> None:
+        with self._active_lmstudio_requests_lock:
+            active = [dict(item) for item in self.active_lmstudio_requests.values()]
+        if hasattr(self, "cancel_lmstudio_button"):
+            can_cancel = bool(active) and any(not item.get("cancelling") for item in active)
+            self.cancel_lmstudio_button.configure(state=tk.NORMAL if can_cancel else tk.DISABLED)
+        if active:
+            elapsed = max(0.0, max(time.monotonic() - float(item["started_at"]) for item in active))
+            chars = sum(int(item.get("progress_chars") or 0) for item in active)
+            suffix = f" • {chars} caractères reçus" if chars else ""
+            self.lmstudio_progress_var.set(f"{len(active)} génération(s) • {elapsed:.1f} s{suffix}")
+            if self._lmstudio_progress_job:
+                try:
+                    self.root.after_cancel(self._lmstudio_progress_job)
+                except Exception:
+                    pass
+            self._lmstudio_progress_job = self.root.after(250, self.update_lmstudio_request_controls)
+        else:
+            self.lmstudio_progress_var.set("")
+            self._lmstudio_progress_job = None
+
+    def lmstudio_request_was_cancelled(self, error: Exception) -> bool:
+        return isinstance(error, LmStudioCancelled)
+
+    def setup_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            return
+
+        if pystray is None or Image is None or ImageDraw is None or ImageFont is None:
+            self.tray_available = False
+            if hasattr(self, "minimize_to_tray_button"):
+                self.minimize_to_tray_button.configure(state=tk.DISABLED)
+            self.log_debug(
+                "warning",
+                "app",
+                "tray_unavailable",
+                "Zone de notification indisponible : pystray/Pillow non installés.",
+            )
+            return
+
+        try:
+            self.tray_images = {
+                "idle": self.create_tray_icon_image(recording=False),
+                "recording": self.create_tray_icon_image(recording=True),
+            }
+            menu = pystray.Menu(
+                pystray.MenuItem("Afficher DrFloW", self.on_tray_show, default=True),
+                pystray.MenuItem("Réduire la fenêtre", self.on_tray_hide),
+                pystray.MenuItem("Quitter DrFloW", self.on_tray_quit),
+            )
+            self.tray_icon = pystray.Icon(
+                APP_NAME,
+                self.tray_images["idle"],
+                self.get_tray_title(),
+                menu,
+            )
+            self.tray_thread = threading.Thread(
+                target=self.tray_icon.run,
+                name="DrFloWTray",
+                daemon=True,
+            )
+            self.tray_thread.start()
+            self.tray_available = True
+            self.log_debug("info", "app", "tray_ready", "Icône de zone de notification prête.")
+        except Exception as exc:
+            self.tray_icon = None
+            self.tray_available = False
+            if hasattr(self, "minimize_to_tray_button"):
+                self.minimize_to_tray_button.configure(state=tk.DISABLED)
+            self.log_debug("warning", "app", "tray_setup_error", str(exc))
+
+    def create_tray_icon_image(self, *, recording: bool = False):
+        size = 64
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        if recording:
+            draw.ellipse((7, 7, 57, 57), fill="#dc2626", outline="#ffffff", width=4)
+            draw.ellipse((23, 23, 41, 41), fill="#ffffff")
+            return image
+
+        draw.rounded_rectangle((6, 6, 58, 58), radius=16, fill="#174ea6", outline="#cfe8ff", width=3)
+        try:
+            font = ImageFont.truetype("segoeuib.ttf", 34)
+        except Exception:
+            font = ImageFont.load_default()
+
+        label = "D"
+        try:
+            text_box = draw.textbbox((0, 0), label, font=font)
+            text_width = text_box[2] - text_box[0]
+            text_height = text_box[3] - text_box[1]
+            text_x = (size - text_width) / 2 - text_box[0]
+            text_y = (size - text_height) / 2 - text_box[1] - 1
+        except Exception:
+            text_x = 24
+            text_y = 18
+        draw.text((text_x, text_y), label, fill="#ffffff", font=font)
+        return image
+
+    def get_tray_title(self) -> str:
+        if self._recording_indicator_active:
+            return f"{APP_NAME} - {self.get_recording_indicator_label(self._recording_indicator_source)}"
+        return f"{APP_NAME} - prêt"
+
+    def update_tray_icon(self) -> None:
+        icon = self.tray_icon
+        if not icon or not self.tray_images:
+            return
+
+        try:
+            icon.icon = self.tray_images["recording" if self._recording_indicator_active else "idle"]
+            icon.title = self.get_tray_title()
+        except Exception as exc:
+            self.log_debug("warning", "app", "tray_update_error", str(exc))
+
+    def on_tray_show(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.restore_from_tray)
+
+    def on_tray_hide(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.minimize_to_tray)
+
+    def on_tray_quit(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.close)
+
+    def minimize_to_tray(self) -> None:
+        if not self.tray_available:
+            self.setup_tray_icon()
+
+        if not self.tray_available:
+            messagebox.showwarning(
+                "Zone de notification",
+                "La zone de notification n'est pas disponible. Installe les dépendances pystray et Pillow.",
+                parent=self.root,
+            )
+            return
+
+        self.tray_hidden = True
+        self.root.withdraw()
+        self.update_tray_icon()
+        self.log_debug("info", "app", "window_minimized_to_tray", "Fenêtre réduite dans la zone de notification.")
+
+    def restore_from_tray(self) -> None:
+        self.tray_hidden = False
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self.update_tray_icon()
+        self.log_debug("info", "app", "window_restored_from_tray", "Fenêtre restaurée depuis la zone de notification.")
+
+    def on_root_unmap(self, event) -> None:
+        if event.widget is not self.root or self._closing or self.tray_hidden:
+            return
+        if not self.tray_available:
+            return
+
+        self.root.after(120, self.minimize_to_tray_if_iconic)
+
+    def minimize_to_tray_if_iconic(self) -> None:
+        if self._closing or self.tray_hidden or not self.tray_available:
+            return
+
+        try:
+            if self.root.state() == "iconic":
+                self.minimize_to_tray()
+        except tk.TclError:
+            pass
+
+    def stop_tray_icon(self) -> None:
+        icon = self.tray_icon
+        self.tray_icon = None
+        self.tray_available = False
+        if not icon:
+            return
+
+        try:
+            icon.stop()
+        except Exception as exc:
+            self.log_debug("warning", "app", "tray_stop_error", str(exc))
+
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8, style="Toolbar.TFrame")
         top.pack(side=tk.TOP, fill=tk.X)
@@ -842,28 +1365,37 @@ class AssistantApp:
         self.document_now_button.pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Label(top, text="Modèle").pack(side=tk.LEFT)
-        ttk.Combobox(
+        self.model_combo = ttk.Combobox(
             top,
             textvariable=self.model_var,
             values=WHISPER_MODEL_CHOICES,
             width=16,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 8))
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.model_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_whisper_runtime_settings())
 
         ttk.Label(top, text="Device").pack(side=tk.LEFT)
-        ttk.Combobox(top, textvariable=self.device_var, values=("cpu", "cuda"), width=8, state="readonly").pack(
-            side=tk.LEFT,
-            padx=(4, 8),
+        self.device_combo = ttk.Combobox(
+            top,
+            textvariable=self.device_var,
+            values=WHISPER_DEVICE_CHOICES,
+            width=8,
+            state="readonly",
         )
+        self.device_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.device_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_whisper_runtime_settings())
 
         ttk.Label(top, text="Compute").pack(side=tk.LEFT)
-        ttk.Combobox(
+        self.compute_combo = ttk.Combobox(
             top,
             textvariable=self.compute_var,
-            values=("int8", "int8_float16", "float16", "float32"),
+            values=WHISPER_COMPUTE_CHOICES,
             width=12,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 8))
+        )
+        self.compute_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.compute_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_whisper_runtime_settings())
 
         ttk.Label(top, text="Micro").pack(side=tk.LEFT)
         self.micro_device_combo = ttk.Combobox(
@@ -879,6 +1411,15 @@ class AssistantApp:
         ttk.Button(top, text="Prévisualiser", command=self.preview_message).pack(side=tk.LEFT, padx=(12, 4))
         ttk.Button(top, text="Envoyer à LM Studio", command=self.send_to_lmstudio, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         self.register_lmstudio_spinner(top, LMSTUDIO_MAIN_SPINNER_KEY)
+        self.cancel_lmstudio_button = ttk.Button(
+            top,
+            text="Annuler génération",
+            command=self.cancel_all_lmstudio_requests,
+            state=tk.DISABLED,
+            style="Danger.TButton",
+        )
+        self.cancel_lmstudio_button.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(top, textvariable=self.lmstudio_progress_var).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Label(top, text="Délai contexte (s)").pack(side=tk.LEFT, padx=(12, 4))
         self.context_delay_spinbox = tk.Spinbox(
@@ -894,6 +1435,13 @@ class AssistantApp:
         self.apply_spinbox_theme(self.context_delay_spinbox)
         self.context_delay_spinbox.bind("<Return>", lambda _event: self.save_context_delay())
         self.context_delay_spinbox.bind("<FocusOut>", lambda _event: self.save_context_delay())
+
+        self.minimize_to_tray_button = ttk.Button(
+            top,
+            text="Zone notif.",
+            command=self.minimize_to_tray,
+        )
+        self.minimize_to_tray_button.pack(side=tk.RIGHT, padx=(8, 0))
 
         connector_bar = ttk.Frame(self.root, padding=(8, 0, 8, 6), style="Toolbar.TFrame")
         connector_bar.pack(side=tk.TOP, fill=tk.X)
@@ -926,6 +1474,66 @@ class AssistantApp:
         )
         self.connector_stop_key_combo.pack(side=tk.LEFT, padx=(4, 12))
         self.connector_stop_key_combo.bind("<<ComboboxSelected>>", lambda _event: self.save_connector_settings())
+
+        ttk.Label(connector_bar, text="Document maintenant").pack(side=tk.LEFT)
+        self.connector_document_now_key_combo = ttk.Combobox(
+            connector_bar,
+            textvariable=self.connector_document_now_key_var,
+            values=key_values,
+            width=12,
+            state="readonly",
+        )
+        self.connector_document_now_key_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.connector_document_now_key_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.save_connector_settings(),
+        )
+
+        ttk.Button(connector_bar, text="Versions / comparer", command=self.show_quality_window).pack(
+            side=tk.RIGHT,
+            padx=(6, 0),
+        )
+        ttk.Button(connector_bar, text="Diagnostic DrFloW", command=self.show_diagnostic_window).pack(
+            side=tk.RIGHT,
+            padx=(6, 0),
+        )
+
+        self.patient_safety_bar = tk.Frame(self.root, bg="#3b1014", padx=8, pady=5)
+        self.patient_safety_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        self.patient_safety_badge = tk.Label(
+            self.patient_safety_bar,
+            text="VERROUILLÉ",
+            bg="#991b1b",
+            fg="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            padx=8,
+            pady=2,
+        )
+        self.patient_safety_badge.pack(side=tk.LEFT, padx=(0, 8))
+        self.patient_safety_title_label = tk.Label(
+            self.patient_safety_bar,
+            textvariable=self.patient_safety_title_var,
+            bg="#3b1014",
+            fg="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.patient_safety_title_label.pack(side=tk.LEFT)
+        self.patient_safety_detail_label = tk.Label(
+            self.patient_safety_bar,
+            textvariable=self.patient_safety_detail_var,
+            bg="#3b1014",
+            fg="#fecaca",
+            font=("Segoe UI", 9),
+        )
+        self.patient_safety_detail_label.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(
+            self.patient_safety_bar,
+            text="Relire contexte",
+            command=self.request_weda_context_refresh,
+        ).pack(
+            side=tk.RIGHT,
+            padx=(6, 0),
+        )
 
         fly_bar = ttk.Frame(self.root, padding=(8, 0, 8, 6), style="Toolbar.TFrame")
         fly_bar.pack(side=tk.TOP, fill=tk.X)
@@ -985,17 +1593,21 @@ class AssistantApp:
         self.context_text = self._add_text_tab(
             "Contexte WEDA",
             buttons=[
-                ("Rafraîchir", self.refresh_context_from_manager),
+                ("Rafraîchir depuis WEDA", self.request_weda_context_refresh),
                 ("Effacer contexte", self.clear_context),
             ],
-            check_context=True,
         )
+        self.transcription_notebook = self._add_series_group_tab("Transcription")
         self.transcription_text = self._add_text_tab(
-            "Transcription",
+            "Transcription brute",
+            parent_notebook=self.transcription_notebook,
             buttons=[
                 ("Copier transcription", self.copy_transcription),
                 ("Effacer transcription", self.clear_transcription),
             ],
+        )
+        self.corrected_transcription_text = self._add_transcription_corrections_tab(
+            parent_notebook=self.transcription_notebook
         )
         self.series_1_notebook = self._add_series_group_tab("Document 1")
         self.prompt_text = self._add_prompt_tab(parent_notebook=self.series_1_notebook)
@@ -1012,7 +1624,7 @@ class AssistantApp:
             parent_notebook=self.series_1_notebook,
             buttons=[
                 ("Copier résultat", self.copy_result),
-                ("Réessayer", self.send_to_lmstudio),
+                ("Réessayer", self.send_to_lmstudio, LMSTUDIO_RESULT_RETRY_SPINNER_KEY),
                 ("Effacer résultat", self.clear_result),
                 ("Importer dans WEDA", self.prepare_weda_import),
             ],
@@ -1036,7 +1648,7 @@ class AssistantApp:
             parent_notebook=self.series_2_notebook,
             buttons=[
                 ("Copier Résultat 2", self.copy_secondary_result),
-                ("Réessayer Prompt 2", self.run_secondary_analysis_manual),
+                ("Réessayer Prompt 2", self.run_secondary_analysis_manual, LMSTUDIO_SECONDARY_RETRY_SPINNER_KEY),
                 ("Effacer Résultat 2", self.clear_secondary_result),
                 ("Importer Résultat 2 dans WEDA", self.prepare_weda_import_result_2),
             ],
@@ -1060,7 +1672,7 @@ class AssistantApp:
             parent_notebook=self.series_3_notebook,
             buttons=[
                 ("Copier Résultat 3", self.copy_tertiary_result),
-                ("Réessayer Prompt 3", self.run_tertiary_analysis_manual),
+                ("Réessayer Prompt 3", self.run_tertiary_analysis_manual, LMSTUDIO_TERTIARY_RETRY_SPINNER_KEY),
                 ("Effacer Résultat 3", self.clear_tertiary_result),
                 ("Importer Résultat 3 dans WEDA", self.prepare_weda_import_result_3),
             ],
@@ -1108,16 +1720,20 @@ class AssistantApp:
             readonly=True,
         )
         self.stt_tab_frame = self._add_stt_engine_tab()
+        self.apply_main_notebook_tab_order()
+        self.install_main_notebook_tab_dragging()
         self.refresh_logs()
 
         self._message_source_widgets = [
             self.context_text,
             self.transcription_text,
+            self.corrected_transcription_text,
             self.prompt_text,
         ]
         self._secondary_message_source_widgets = [
             self.context_text,
             self.transcription_text,
+            self.corrected_transcription_text,
             self.prompt_text,
             self.result_text,
             self.secondary_prompt_text,
@@ -1125,6 +1741,7 @@ class AssistantApp:
         self._tertiary_message_source_widgets = [
             self.context_text,
             self.transcription_text,
+            self.corrected_transcription_text,
             self.prompt_text,
             self.result_text,
             self.secondary_prompt_text,
@@ -1134,8 +1751,11 @@ class AssistantApp:
         self._document_now_message_source_widgets = [
             self.context_text,
             self.transcription_text,
+            self.corrected_transcription_text,
+            self.document_now_default_prompt_text,
             self.document_now_prompt_text,
         ]
+        self.install_rich_result_copy_bindings()
 
         status = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1249,9 +1869,24 @@ class AssistantApp:
         self.stt_server_entry.bind("<FocusOut>", lambda _event: self.save_stt_settings())
 
         ttk.Label(controls, text="Comparer").grid(row=3, column=3, sticky=tk.W, padx=(0, 4), pady=3)
-        ttk.Checkbutton(controls, text="faster-whisper", variable=self.stt_compare_faster_var).grid(row=3, column=4, sticky=tk.W)
-        ttk.Checkbutton(controls, text="Qwen3-ASR", variable=self.stt_compare_qwen_var).grid(row=3, column=5, sticky=tk.W)
-        ttk.Checkbutton(controls, text="Voxtral", variable=self.stt_compare_voxtral_var).grid(row=3, column=6, sticky=tk.W)
+        ttk.Checkbutton(
+            controls,
+            text="faster-whisper",
+            variable=self.stt_compare_faster_var,
+            command=self.save_stt_settings,
+        ).grid(row=3, column=4, sticky=tk.W)
+        ttk.Checkbutton(
+            controls,
+            text="Qwen3-ASR",
+            variable=self.stt_compare_qwen_var,
+            command=self.save_stt_settings,
+        ).grid(row=3, column=5, sticky=tk.W)
+        ttk.Checkbutton(
+            controls,
+            text="Voxtral",
+            variable=self.stt_compare_voxtral_var,
+            command=self.save_stt_settings,
+        ).grid(row=3, column=6, sticky=tk.W)
         ttk.Button(controls, text="Utiliser résultat sélectionné", command=self.use_selected_stt_benchmark_result).grid(
             row=3,
             column=8,
@@ -1314,7 +1949,6 @@ class AssistantApp:
         parent_notebook: ttk.Notebook | None = None,
         buttons=None,
         readonly: bool = False,
-        check_context: bool = False,
         message_controls: bool = False,
         message_document_index: int = 1,
         message_send_command=None,
@@ -1329,8 +1963,11 @@ class AssistantApp:
 
         toolbar = ttk.Frame(frame)
         toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
-        for label, command in buttons or []:
+        for button_config in buttons or []:
+            label, command = button_config[:2]
             ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
+            if len(button_config) >= 3 and button_config[2]:
+                self.register_lmstudio_spinner(toolbar, str(button_config[2]))
         if message_controls:
             self.add_message_composition_controls(
                 toolbar,
@@ -1343,14 +1980,6 @@ class AssistantApp:
             self.add_result_destination_controls(toolbar)
             for label, command in destination_buttons or []:
                 ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
-        if check_context:
-            ttk.Checkbutton(
-                toolbar,
-                text="Inclure dans Message 1",
-                variable=self.include_context_var,
-                command=self.save_message_composition_settings,
-            ).pack(side=tk.LEFT, padx=(8, 0))
-
         text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(frame, command=text.yview)
@@ -1396,7 +2025,7 @@ class AssistantApp:
         combo = ttk.Combobox(
             toolbar,
             textvariable=self.result_destination_var,
-            values=("WEDA consultation", "WEDA courrier", "Presse-papiers", "PDF structuré"),
+            values=RESULT_DESTINATION_CHOICES,
             width=17,
             state="readonly",
         )
@@ -1416,7 +2045,7 @@ class AssistantApp:
         toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         self.prompt_combo = ttk.Combobox(toolbar, textvariable=self.prompt_var, width=38, state="readonly")
         self.prompt_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self.prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_prompt())
+        self.prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_prompt_selected())
 
         for label, command in (
             ("Nouveau", self.new_prompt),
@@ -1455,7 +2084,7 @@ class AssistantApp:
             state="readonly",
         )
         self.secondary_prompt_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self.secondary_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_secondary_prompt())
+        self.secondary_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_secondary_prompt_selected())
 
         for label, command in (
             ("Nouveau", self.new_secondary_prompt),
@@ -1495,7 +2124,7 @@ class AssistantApp:
             state="readonly",
         )
         self.tertiary_prompt_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self.tertiary_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_tertiary_prompt())
+        self.tertiary_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_tertiary_prompt_selected())
 
         for label, command in (
             ("Nouveau", self.new_tertiary_prompt),
@@ -1529,7 +2158,7 @@ class AssistantApp:
             state="readonly",
         )
         self.document_now_prompt_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self.document_now_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_document_now_prompt())
+        self.document_now_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_document_now_prompt_selected())
 
         for label, command in (
             ("Nouveau", self.new_document_now_prompt),
@@ -1543,9 +2172,35 @@ class AssistantApp:
             button_style = "Accent.TButton" if label == "Document maintenant" else "TButton"
             ttk.Button(toolbar, text=label, command=command, style=button_style).pack(side=tk.LEFT, padx=(0, 6))
 
-        text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
+        default_frame = ttk.LabelFrame(frame, text="Prompt par défaut ajouté au Document maintenant", padding=6)
+        default_frame.pack(side=tk.TOP, fill=tk.BOTH, pady=(0, 6))
+        default_toolbar = ttk.Frame(default_frame)
+        default_toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        ttk.Button(default_toolbar, text="Enregistrer défaut", command=self.save_document_now_default_prompt).pack(
+            side=tk.LEFT,
+            padx=(0, 6),
+        )
+        ttk.Button(default_toolbar, text="Réinitialiser défaut", command=self.reset_document_now_default_prompt).pack(
+            side=tk.LEFT,
+            padx=(0, 6),
+        )
+        default_body = ttk.Frame(default_frame)
+        default_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.document_now_default_prompt_text = self.create_text_widget(default_body, wrap=tk.WORD, undo=True, height=4)
+        self.document_now_default_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        default_scrollbar = ttk.Scrollbar(default_body, command=self.document_now_default_prompt_text.yview)
+        default_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.document_now_default_prompt_text.configure(yscrollcommand=default_scrollbar.set)
+        self.set_text(
+            self.document_now_default_prompt_text,
+            str(self.config.setdefault("document_now", {}).get("default_prompt_prefix") or DEFAULT_DOCUMENT_NOW_PROMPT_PREFIX),
+        )
+
+        prompt_frame = ttk.LabelFrame(frame, text="Prompt sélectionné", padding=6)
+        prompt_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        text = self.create_text_widget(prompt_frame, wrap=tk.WORD, undo=True, height=10)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        scrollbar = ttk.Scrollbar(prompt_frame, command=text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         text.configure(yscrollcommand=scrollbar.set)
         return text
@@ -1574,14 +2229,80 @@ class AssistantApp:
             ("Dupliquer", self.duplicate_whisper_initial_prompt),
             ("Supprimer", self.delete_whisper_initial_prompt),
             ("Activer", self.activate_selected_whisper_initial_prompt),
+            ("Restaurer le prompt par défaut", self.restore_default_whisper_medical_prompt),
         ):
             ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
 
-        text = self.create_text_widget(frame, wrap=tk.WORD, undo=True, height=10)
+        options = ttk.Frame(frame)
+        options.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(
+            options,
+            text="Ajouter automatiquement le contexte WEDA au prompt Whisper",
+            variable=self.whisper_include_weda_context_var,
+            command=self.save_medical_transcription_settings,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            options,
+            text="Utiliser les hotwords dynamiques WEDA",
+            variable=self.whisper_use_dynamic_hotwords_var,
+            command=self.save_medical_transcription_settings,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            options,
+            text="Appliquer les corrections locales très fiables",
+            variable=self.whisper_apply_corrections_var,
+            command=self.save_medical_transcription_settings,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(options, text="Diagnostic Whisper", command=self.show_whisper_diagnostic_window).pack(side=tk.RIGHT)
+
+        prompt_frame = ttk.LabelFrame(frame, text="Prompt médical Whisper (base fixe)", padding=6)
+        prompt_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
+        text = self.create_text_widget(prompt_frame, wrap=tk.WORD, undo=True, height=7)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        scrollbar = ttk.Scrollbar(prompt_frame, command=text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         text.configure(yscrollcommand=scrollbar.set)
+
+        lexicon_frame = ttk.LabelFrame(frame, text="Lexique médical local permanent (un terme par ligne)", padding=6)
+        lexicon_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False)
+        self.permanent_hotwords_text = self.create_text_widget(lexicon_frame, wrap=tk.WORD, undo=True, height=5)
+        self.permanent_hotwords_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lexicon_scrollbar = ttk.Scrollbar(lexicon_frame, command=self.permanent_hotwords_text.yview)
+        lexicon_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.permanent_hotwords_text.configure(yscrollcommand=lexicon_scrollbar.set)
+        permanent = self.config.get("medical_transcription", {}).get(
+            "permanent_hotwords", list(DEFAULT_PERMANENT_MEDICAL_HOTWORDS)
+        )
+        self.set_text(self.permanent_hotwords_text, "\n".join(parse_permanent_hotwords(permanent)))
+        return text
+
+    def _add_transcription_corrections_tab(self, *, parent_notebook: ttk.Notebook | None = None) -> tk.Text:
+        notebook = parent_notebook or self.notebook
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Transcription corrigée")
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        for label, command in (
+            ("Repartir de la transcription brute", self.reset_corrected_transcription),
+            ("Comparer les corrections", self.review_transcription_corrections),
+            ("Valider explicitement", self.validate_transcription_corrections),
+            ("Rejeter", self.reject_transcription_corrections),
+        ):
+            ttk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=(0, 6))
+        text_frame = ttk.LabelFrame(frame, text="Version corrigée, fidèle et non reformulée", padding=6)
+        text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
+        text = self.create_text_widget(text_frame, wrap=tk.WORD, undo=True, height=8)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(text_frame, command=text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=scrollbar.set)
+        review_frame = ttk.LabelFrame(frame, text="Différences proposées — aucune n’est apprise sans validation", padding=6)
+        review_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.correction_review_text = self.create_text_widget(review_frame, wrap=tk.WORD, undo=False, height=6)
+        self.correction_review_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        review_scrollbar = ttk.Scrollbar(review_frame, command=self.correction_review_text.yview)
+        review_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.correction_review_text.configure(yscrollcommand=review_scrollbar.set, state=tk.DISABLED)
         return text
 
     def _add_abbreviations_tab(self) -> tk.Text:
@@ -1613,14 +2334,16 @@ class AssistantApp:
         toolbar = ttk.Frame(frame)
         toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
+        pdf_action_spinner_keys = {
+            "Remplir PDF": PDF_FILL_SPINNER_KEY,
+        }
         for label, command in (
             ("Importer modèle PDF", self.import_pdf_template),
             ("Renommer", self.rename_pdf_template),
             ("Supprimer", self.delete_pdf_template),
             ("Enregistrer champ", self.save_selected_pdf_field),
-            ("Générer valeurs avec Gemma", self.generate_pdf_values_with_gemma),
+            ("Remplir PDF", self.fill_pdf_with_gemma),
             ("Copier JSON", self.copy_pdf_json),
-            ("Remplir / exporter PDF", self.fill_and_export_pdf),
             ("Ouvrir PDF final", self.open_last_pdf_output),
             ("Purger historique local", self.purge_local_history),
         ):
@@ -1628,8 +2351,11 @@ class AssistantApp:
                 toolbar,
                 text=label,
                 command=command,
-                style="Accent.TButton" if label in {"Générer valeurs avec Gemma", "Remplir / exporter PDF"} else "TButton",
+                style="Accent.TButton" if label == "Remplir PDF" else "TButton",
             ).pack(side=tk.LEFT, padx=(0, 6))
+            spinner_key = pdf_action_spinner_keys.get(label)
+            if spinner_key:
+                self.register_lmstudio_spinner(toolbar, spinner_key)
 
         selector = ttk.Frame(frame)
         selector.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
@@ -1641,7 +2367,7 @@ class AssistantApp:
             state="readonly",
         )
         self.pdf_template_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.pdf_template_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_pdf_template())
+        self.pdf_template_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_pdf_template_selected())
 
         ttk.Label(selector, text="Prompt PDF").pack(side=tk.LEFT)
         self.pdf_prompt_combo = ttk.Combobox(
@@ -1914,6 +2640,10 @@ class AssistantApp:
 
     def ensure_document_now_prompt(self) -> None:
         document_now_config = self.config.setdefault("document_now", {})
+        changed = False
+        if "default_prompt_prefix" not in document_now_config:
+            document_now_config["default_prompt_prefix"] = DEFAULT_DOCUMENT_NOW_PROMPT_PREFIX
+            changed = True
         prompt = self.prompt_manager.get(DOCUMENT_NOW_PROMPT_ID) or self.prompt_manager.get_by_name(DOCUMENT_NOW_PROMPT_NAME)
         if prompt is None:
             prompt = self.prompt_manager.create(
@@ -1928,7 +2658,6 @@ class AssistantApp:
 
         default_prompt_id = str(document_now_config.get("default_prompt_id") or "")
         selected = self.prompt_manager.get(default_prompt_id)
-        changed = False
         if selected is None or selected.prompt_type != "generic":
             document_now_config["default_prompt_id"] = prompt.id
             changed = True
@@ -1939,6 +2668,8 @@ class AssistantApp:
                 pass
 
     def on_result_destination_changed(self) -> None:
+        self.capture_ui_selection_settings()
+        self.write_runtime_config("result_destination")
         if self.result_destination_var.get() == "PDF structuré" and hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
 
@@ -1952,6 +2683,8 @@ class AssistantApp:
             self.pdf_prompt_combo["values"] = [prompt.name for prompt in prompts]
         selected = self.prompt_manager.get(selected_id) if selected_id else None
         if selected is None:
+            selected = self.prompt_manager.get(str(self.config.get("pdf", {}).get("last_prompt_id") or ""))
+        if selected is None:
             selected = self.prompt_manager.get(str(self.config.get("pdf", {}).get("default_prompt_id") or ""))
         if selected is None or selected.prompt_type != "pdf_form_fill":
             selected = self.prompt_manager.get_default("pdf_form_fill")
@@ -1964,6 +2697,8 @@ class AssistantApp:
 
     def on_pdf_prompt_selected(self) -> None:
         self.load_selected_pdf_prompt()
+        self.capture_pdf_selection_settings()
+        self.write_runtime_config("pdf_prompt_selection")
         self.save_pdf_template_prompt()
 
     def load_selected_pdf_prompt(self) -> None:
@@ -2033,7 +2768,9 @@ class AssistantApp:
         if not prompt:
             return
         self.prompt_manager.set_default(prompt.id)
-        self.config.setdefault("pdf", {})["default_prompt_id"] = prompt.id
+        pdf_config = self.config.setdefault("pdf", {})
+        pdf_config["default_prompt_id"] = prompt.id
+        pdf_config["last_prompt_id"] = prompt.id
         try:
             save_json(BASE_DIR / "config.json", self.config)
         except Exception as exc:
@@ -2067,8 +2804,9 @@ class AssistantApp:
             self.render_pdf_preview()
             return
 
+        template_id_to_select = selected_id or str(self.config.get("pdf", {}).get("last_template_id") or "")
         selected_label = next(
-            (label for label, template_id in self.pdf_template_name_to_id.items() if template_id == selected_id),
+            (label for label, template_id in self.pdf_template_name_to_id.items() if template_id == template_id_to_select),
             labels[0],
         )
         self.pdf_template_var.set(selected_label)
@@ -2076,6 +2814,11 @@ class AssistantApp:
 
     def current_pdf_template_id(self) -> str:
         return self.pdf_template_name_to_id.get(self.pdf_template_var.get(), "")
+
+    def on_pdf_template_selected(self) -> None:
+        self.load_selected_pdf_template()
+        self.capture_pdf_selection_settings()
+        self.write_runtime_config("pdf_template_selection")
 
     def load_selected_pdf_template(self) -> None:
         template_id = self.current_pdf_template_id()
@@ -2193,12 +2936,7 @@ class AssistantApp:
             self.log_debug("warning", "pdf", "pdf_template_prompt_save_error", str(exc))
 
     def save_pdf_source_preference(self) -> None:
-        pdf_config = self.config.setdefault("pdf", {})
-        source = self.pdf_source_var.get() or "Résultat 1 + Résultat 2"
-        if source not in PDF_SOURCE_CHOICES:
-            source = "Résultat 1 + Résultat 2"
-            self.pdf_source_var.set(source)
-        pdf_config["preferred_source"] = source
+        self.capture_pdf_selection_settings()
         try:
             save_json(BASE_DIR / "config.json", self.config)
         except Exception as exc:
@@ -2328,11 +3066,28 @@ class AssistantApp:
                 "pdf_schema": json.dumps(schema, ensure_ascii=False, indent=2),
             }
         )
-        return self.prompt_manager.render_prompt(prompt_content, variables)
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_content,
+            variables,
+            lambda working_variables: self.prompt_manager.render_prompt(prompt_content, working_variables),
+            label="pdf_structure",
+            max_tokens=int(self.config.get("pdf", {}).get("max_tokens") or 8192),
+        )
+        return message
 
-    def generate_pdf_values_with_gemma(self) -> None:
+    def fill_pdf_with_gemma(self) -> None:
+        self.generate_pdf_values_with_gemma(auto_export=True)
+
+    def generate_pdf_values_with_gemma(self, *, auto_export: bool = False) -> None:
+        if self.is_lmstudio_request_active("pdf_form"):
+            self.pdf_status_var.set("PDF: génération déjà en cours")
+            return
         if not self.current_pdf_template_id():
             messagebox.showwarning("PDF structuré", "Sélectionne ou importe d’abord un modèle PDF.", parent=self.root)
+            return
+        if "Contexte" in str(self.pdf_source_var.get() or "") and not self.require_fresh_patient_context(
+            "Génération du PDF"
+        ):
             return
         try:
             message = self.build_pdf_lmstudio_message()
@@ -2341,20 +3096,24 @@ class AssistantApp:
             return
         self.set_text(self.sent_message_text, message, readonly=True)
         self.result_destination_var.set("PDF structuré")
+        self.on_result_destination_changed()
         self.lmstudio_status_var.set("LM Studio: génération JSON PDF")
         self.pdf_status_var.set("PDF: demande Gemma en cours")
         pdf_config = self.config.get("pdf", {})
         client = self.build_lmstudio_client(max_tokens=int(pdf_config.get("max_tokens") or 8192))
+        self.adjust_lmstudio_client_for_context(client, message, label="pdf_structure")
         response_format = self.build_pdf_response_format()
+        self.start_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
 
-        def worker():
-            try:
-                response = client.chat(message, response_format=response_format)
-                self.root.after(0, self.on_pdf_lmstudio_response, response, message)
-            except Exception as exc:
-                self.root.after(0, self.on_pdf_lmstudio_error, exc)
-
-        threading.Thread(target=worker, name="lmstudio-pdf-form", daemon=True).start()
+        self.launch_lmstudio_request(
+            "pdf_form",
+            client,
+            message,
+            response_format=response_format,
+            on_success=lambda response: self.on_pdf_lmstudio_response(response, message, auto_export),
+            on_error=self.on_pdf_lmstudio_error,
+            thread_name="lmstudio-pdf-form",
+        )
 
     def build_pdf_response_format(self) -> dict | None:
         lm_config = self.config.get("lmstudio", {})
@@ -2369,17 +3128,28 @@ class AssistantApp:
             },
         }
 
-    def on_pdf_lmstudio_response(self, response, sent_message: str) -> None:
+    def on_pdf_lmstudio_response(self, response, sent_message: str, auto_export: bool = False) -> None:
+        if not auto_export:
+            self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
         try:
             parsed_json = parse_json_object_result(response.text)
             raw_values = parsed_json.values
             values, issues = validate_pdf_field_values(raw_values, self.pdf_current_fields)
         except Exception as exc:
+            self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
             self.lmstudio_status_var.set("LM Studio: JSON PDF invalide")
             self.pdf_status_var.set("PDF: réponse JSON invalide")
             self.set_text(self.pdf_json_text, response.text)
             messagebox.showerror("JSON PDF", str(exc), parent=self.root)
             return
+        self.record_generation_metric(
+            "pdf_form",
+            "pdf_form",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message or ""),
+            result_chars=len(response.text or ""),
+        )
 
         if parsed_json.recovered_partial:
             issues.insert(
@@ -2427,8 +3197,20 @@ class AssistantApp:
                 "status": "pdf_values_generated",
             }
         )
+        if auto_export:
+            self.pdf_status_var.set("PDF: valeurs reçues, export en cours")
+            if not self.fill_and_export_pdf(skip_manual_validation=True):
+                self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
 
     def on_pdf_lmstudio_error(self, error: Exception) -> None:
+        self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric("pdf_form", "pdf_form", status="cancelled", error=error)
+            self.lmstudio_status_var.set("LM Studio: génération PDF annulée")
+            self.pdf_status_var.set("PDF: génération annulée")
+            self.log_debug("info", "pdf", "pdf_lmstudio_cancelled", str(error))
+            return
+        self.record_generation_metric("pdf_form", "pdf_form", status="error", error=error)
         self.lmstudio_status_var.set("LM Studio: erreur JSON PDF")
         self.pdf_status_var.set("PDF: génération impossible")
         self.log_debug("error", "pdf", "pdf_lmstudio_error", str(error))
@@ -2494,15 +3276,15 @@ class AssistantApp:
         ok = copy_text_to_clipboard(self.get_text(self.pdf_json_text), self.root)
         self.pdf_status_var.set("PDF: JSON copié" if ok else "PDF: copie JSON impossible")
 
-    def fill_and_export_pdf(self) -> None:
+    def fill_and_export_pdf(self, *, skip_manual_validation: bool = False) -> bool:
         if not self.current_pdf_template_id() or not self.pdf_current_fields:
             messagebox.showwarning("PDF structuré", "Sélectionne un modèle PDF.", parent=self.root)
-            return
+            return False
         if not self.parse_pdf_json_from_editor():
-            return
+            return False
         if not self.pdf_current_values:
             messagebox.showwarning("PDF structuré", "Aucune valeur PDF à remplir.", parent=self.root)
-            return
+            return False
 
         issue_lines = [f"- {issue.get('field')}: {issue.get('message')}" for issue in self.pdf_current_issues]
         details = "\n".join(issue_lines[:8])
@@ -2510,12 +3292,12 @@ class AssistantApp:
             details += f"\n... +{len(issue_lines) - 8} autre(s) alerte(s)"
 
         pdf_config = self.config.get("pdf", {})
-        if bool(pdf_config.get("require_manual_validation", True)):
+        if not skip_manual_validation and bool(pdf_config.get("require_manual_validation", True)):
             message = "Générer le PDF final avec les valeurs affichées ?\n\nLe modèle original restera intact."
             if details:
                 message += "\n\nAlertes à vérifier :\n" + details
             if not messagebox.askyesno("Validation humaine requise", message, parent=self.root):
-                return
+                return False
 
         context = self.context_manager.get_latest()
         patient_identity = context.patient_identity if context else ""
@@ -2524,49 +3306,68 @@ class AssistantApp:
             template_name=template_name,
             patient_identity=patient_identity,
         )
+        template_path = self.pdf_current_metadata.get("template_path") or self.pdf_template_manager.template_pdf_path(self.pdf_current_template_id)
+        values_snapshot = dict(self.pdf_current_values)
+        fields_snapshot = [dict(field) for field in self.pdf_current_fields]
+        history_payload = {
+            **self.current_stt_history_payload(),
+            "prompt_name": self.pdf_prompt_var.get(),
+            "prompt_type": "pdf_form_fill",
+            "pdf_template_id": self.pdf_current_template_id,
+            "pdf_template_name": template_name,
+            "pdf_fields": fields_snapshot,
+            "pdf_generated_json": values_snapshot,
+            "result_1": self.get_text(self.result_text),
+            "result_2": self.get_text(self.secondary_result_text),
+            "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
+            "document_now_result": (
+                self.get_text(self.document_now_result_text)
+                if hasattr(self, "document_now_result_text")
+                else ""
+            ),
+            "pdf_source": self.pdf_source_var.get(),
+        }
+        open_after_export = bool(pdf_config.get("open_after_export", True))
+        self.pdf_status_var.set("PDF: export en cours")
+        self.start_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
 
-        try:
-            result = self.pdf_fill_manager.fill_pdf(
-                self.pdf_current_metadata.get("template_path") or self.pdf_template_manager.template_pdf_path(self.pdf_current_template_id),
-                self.pdf_current_values,
-                output_path,
-                fields=self.pdf_current_fields,
-            )
-        except Exception as exc:
-            self.pdf_status_var.set("PDF: export impossible")
-            messagebox.showerror("PDF structuré", str(exc), parent=self.root)
-            return
+        def worker():
+            try:
+                result = self.pdf_fill_manager.fill_pdf(
+                    template_path,
+                    values_snapshot,
+                    output_path,
+                    fields=fields_snapshot,
+                )
+                self.root.after(0, self.on_pdf_export_success, result, history_payload, open_after_export)
+            except Exception as exc:
+                self.root.after(0, self.on_pdf_export_error, exc)
 
+        threading.Thread(target=worker, name="pdf-structured-export", daemon=True).start()
+        return True
+
+    def on_pdf_export_success(self, result, history_payload: dict, open_after_export: bool) -> None:
+        self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
         self.pdf_last_output_path = str(result.output_path)
         self.pdf_status_var.set(f"PDF: exporté {result.output_path.name}")
-        self.history_manager.append(
+        history_payload.update(
             {
-                **self.current_stt_history_payload(),
-                "prompt_name": self.pdf_prompt_var.get(),
-                "prompt_type": "pdf_form_fill",
-                "pdf_template_id": self.pdf_current_template_id,
-                "pdf_template_name": template_name,
-                "pdf_fields": self.pdf_current_fields,
-                "pdf_generated_json": self.pdf_current_values,
                 "pdf_final_path": str(result.output_path),
                 "pdf_export_status": "exported",
                 "pdf_warnings": result.warnings,
-                "result_1": self.get_text(self.result_text),
-                "result_2": self.get_text(self.secondary_result_text),
-                "result_3": self.get_text(self.tertiary_result_text) if hasattr(self, "tertiary_result_text") else "",
-                "document_now_result": (
-                    self.get_text(self.document_now_result_text)
-                    if hasattr(self, "document_now_result_text")
-                    else ""
-                ),
-                "pdf_source": self.pdf_source_var.get(),
                 "status": "pdf_exported",
             }
         )
+        self.history_manager.append(history_payload)
         if result.warnings:
             self.log_debug("warning", "pdf", "pdf_export_warnings", "PDF exporté avec alertes.", {"warnings": result.warnings})
-        if bool(pdf_config.get("open_after_export", True)):
+        if open_after_export:
             self.open_last_pdf_output()
+
+    def on_pdf_export_error(self, error: Exception) -> None:
+        self.stop_lmstudio_spinner(PDF_FILL_SPINNER_KEY)
+        self.pdf_status_var.set("PDF: export impossible")
+        messagebox.showerror("PDF structuré", str(error), parent=self.root)
 
     def open_last_pdf_output(self) -> None:
         if not self.pdf_last_output_path:
@@ -2704,11 +3505,299 @@ class AssistantApp:
                 pass
         self._document_now_message_refresh_job = self.root.after(delay_ms, self.refresh_document_now_sent_message)
 
-    def save_message_composition_settings(self) -> None:
+    def write_runtime_config(self, reason: str = "settings") -> bool:
+        try:
+            save_json(BASE_DIR / "config.json", self.config)
+            return True
+        except Exception as exc:
+            self.log_debug("error", "app", "runtime_config_save_error", str(exc), {"reason": reason})
+            return False
+
+    def normalize_result_destination(self) -> str:
+        value = self.result_destination_var.get() if hasattr(self, "result_destination_var") else "WEDA consultation"
+        if value not in RESULT_DESTINATION_CHOICES:
+            value = "WEDA consultation"
+            if hasattr(self, "result_destination_var"):
+                self.result_destination_var.set(value)
+        return value
+
+    def normalize_pdf_source_choice(self) -> str:
+        value = self.pdf_source_var.get() if hasattr(self, "pdf_source_var") else "Résultat 1 + Résultat 2"
+        if value not in PDF_SOURCE_CHOICES:
+            value = "Résultat 1 + Résultat 2"
+            if hasattr(self, "pdf_source_var"):
+                self.pdf_source_var.set(value)
+        return value
+
+    def capture_message_composition_settings(self) -> None:
+        if not all(hasattr(self, name) for name in ("include_prompt_var", "include_context_var", "include_transcription_var")):
+            return
         message_config = self.config.setdefault("message_composition", {})
         message_config["include_prompt"] = bool(self.include_prompt_var.get())
         message_config["include_weda_context"] = bool(self.include_context_var.get())
         message_config["include_transcription"] = bool(self.include_transcription_var.get())
+
+    def capture_ui_selection_settings(self) -> None:
+        ui_config = self.config.setdefault("ui", {})
+        if hasattr(self, "result_destination_var"):
+            ui_config["result_destination"] = self.normalize_result_destination()
+        if hasattr(self, "notebook"):
+            ui_config["main_notebook_tab_order"] = self.get_main_notebook_tab_order()
+
+    def get_main_notebook_tab_order(self) -> list[str]:
+        if not hasattr(self, "notebook"):
+            return []
+        labels = []
+        for tab_id in self.notebook.tabs():
+            try:
+                label = str(self.notebook.tab(tab_id, "text") or "").strip()
+            except tk.TclError:
+                label = ""
+            if label:
+                labels.append(label)
+        return labels
+
+    def apply_main_notebook_tab_order(self) -> None:
+        if not hasattr(self, "notebook"):
+            return
+        stored_order = self.config.get("ui", {}).get("main_notebook_tab_order")
+        if not isinstance(stored_order, list) or not stored_order:
+            return
+
+        tabs_by_label = {}
+        current_order = []
+        for tab_id in self.notebook.tabs():
+            try:
+                label = str(self.notebook.tab(tab_id, "text") or "").strip()
+            except tk.TclError:
+                continue
+            if not label or label in tabs_by_label:
+                continue
+            tabs_by_label[label] = tab_id
+            current_order.append(label)
+
+        migrated_order = migrate_main_notebook_tab_order(stored_order)
+        ordered_labels = [label for label in migrated_order if label in tabs_by_label]
+        ordered_labels.extend(label for label in current_order if label not in ordered_labels)
+        if ordered_labels == current_order:
+            return
+
+        selected = self.notebook.select()
+        for index, label in enumerate(ordered_labels):
+            try:
+                self.notebook.insert(index, tabs_by_label[label])
+            except tk.TclError:
+                continue
+        if selected:
+            try:
+                self.notebook.select(selected)
+            except tk.TclError:
+                pass
+
+    def install_main_notebook_tab_dragging(self) -> None:
+        if not hasattr(self, "notebook") or getattr(self.notebook, "_drflow_tab_drag_installed", False):
+            return
+        self.notebook._drflow_tab_drag_installed = True
+        self.notebook.bind("<ButtonPress-1>", self.on_main_notebook_tab_press, add="+")
+        self.notebook.bind("<B1-Motion>", self.on_main_notebook_tab_motion, add="+")
+        self.notebook.bind("<ButtonRelease-1>", self.on_main_notebook_tab_release, add="+")
+
+    def main_notebook_tab_index_at(self, x: int, y: int) -> int | None:
+        if not hasattr(self, "notebook"):
+            return None
+        try:
+            element = str(self.notebook.identify(x, y) or "")
+        except tk.TclError:
+            element = ""
+        if not element:
+            return None
+        try:
+            return int(self.notebook.index(f"@{x},{y}"))
+        except (tk.TclError, ValueError):
+            return None
+
+    def on_main_notebook_tab_press(self, event) -> None:
+        index = self.main_notebook_tab_index_at(event.x, event.y)
+        self._main_notebook_drag_index = index
+        self._main_notebook_drag_active = False
+        self._main_notebook_drag_start_x = int(event.x)
+        self._main_notebook_drag_start_y = int(event.y)
+
+    def on_main_notebook_tab_motion(self, event) -> None:
+        if self._main_notebook_drag_index is None:
+            return
+        distance = abs(int(event.x) - self._main_notebook_drag_start_x) + abs(int(event.y) - self._main_notebook_drag_start_y)
+        if not self._main_notebook_drag_active and distance < 8:
+            return
+
+        target_index = self.main_notebook_tab_index_at(event.x, event.y)
+        if target_index is None or target_index == self._main_notebook_drag_index:
+            return
+
+        tabs = self.notebook.tabs()
+        if self._main_notebook_drag_index < 0 or self._main_notebook_drag_index >= len(tabs):
+            return
+
+        dragged_tab = tabs[self._main_notebook_drag_index]
+        try:
+            self.notebook.insert(target_index, dragged_tab)
+            self.notebook.select(dragged_tab)
+            self._main_notebook_drag_index = int(self.notebook.index(dragged_tab))
+            self._main_notebook_drag_active = True
+        except tk.TclError:
+            return
+
+    def on_main_notebook_tab_release(self, _event) -> None:
+        should_save = self._main_notebook_drag_active
+        self._main_notebook_drag_index = None
+        self._main_notebook_drag_active = False
+        if should_save:
+            self.config.setdefault("ui", {})["main_notebook_tab_order"] = self.get_main_notebook_tab_order()
+            self.write_runtime_config("main_notebook_tab_order")
+
+    def capture_pdf_selection_settings(self) -> None:
+        pdf_config = self.config.setdefault("pdf", {})
+        if hasattr(self, "pdf_source_var"):
+            pdf_config["preferred_source"] = self.normalize_pdf_source_choice()
+        if hasattr(self, "pdf_template_name_to_id"):
+            template_id = self.current_pdf_template_id()
+            if template_id:
+                pdf_config["last_template_id"] = template_id
+        if hasattr(self, "pdf_prompt_name_to_id"):
+            prompt_id = self.current_pdf_prompt_id()
+            if prompt_id:
+                pdf_config["last_prompt_id"] = prompt_id
+
+    def capture_prompt_selection_settings(self) -> None:
+        if hasattr(self, "prompt_name_to_id"):
+            prompt_id = self.current_prompt_id()
+            if prompt_id:
+                self.config.setdefault("ui", {})["last_prompt_id"] = prompt_id
+
+        if hasattr(self, "secondary_prompt_name_to_id"):
+            secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
+            if hasattr(self, "secondary_enabled_var"):
+                secondary_config["enabled"] = bool(self.secondary_enabled_var.get())
+            prompt_id = self.current_secondary_prompt_id()
+            if prompt_id:
+                secondary_config["last_prompt_id"] = prompt_id
+            self.config["secondary_analysis"] = secondary_config
+
+        if hasattr(self, "tertiary_prompt_name_to_id"):
+            tertiary_config = normalize_tertiary_analysis_config(self.config.get("tertiary_analysis", {}))
+            if hasattr(self, "tertiary_enabled_var"):
+                tertiary_config["enabled"] = bool(self.tertiary_enabled_var.get())
+            prompt_id = self.current_tertiary_prompt_id()
+            if prompt_id:
+                tertiary_config["last_prompt_id"] = prompt_id
+            self.config["tertiary_analysis"] = tertiary_config
+
+        if hasattr(self, "document_now_prompt_name_to_id"):
+            prompt_id = self.current_document_now_prompt_id()
+            if prompt_id:
+                self.config.setdefault("document_now", {})["last_prompt_id"] = prompt_id
+
+    def capture_document_now_default_prompt_setting(self) -> None:
+        if not hasattr(self, "document_now_default_prompt_text"):
+            return
+        self.config.setdefault("document_now", {})["default_prompt_prefix"] = self.get_text(
+            self.document_now_default_prompt_text
+        )
+
+    def capture_context_delay_setting(self) -> None:
+        if not hasattr(self, "context_delay_seconds_var"):
+            return
+        try:
+            value = int(float(self.context_delay_seconds_var.get()))
+        except (TypeError, ValueError):
+            value = self.get_context_capture_delay_seconds()
+        value = max(0, min(300, value))
+        self.context_delay_seconds_var.set(str(value))
+        self.config.setdefault("weda", {})["context_capture_delay_seconds"] = value
+
+    def capture_connector_settings(self) -> None:
+        if not all(
+            hasattr(self, name)
+            for name in (
+                "connector_enabled_var",
+                "connector_start_key_var",
+                "connector_stop_key_var",
+                "connector_document_now_key_var",
+            )
+        ):
+            return
+        start_key = self.connector_start_key_var.get() or "PageUp"
+        stop_key = self.connector_stop_key_var.get() or "PageDown"
+        document_now_key = self.connector_document_now_key_var.get() or "F8"
+        if start_key == stop_key:
+            stop_key = "PageDown" if start_key != "PageDown" else "PageUp"
+            self.connector_stop_key_var.set(stop_key)
+        if document_now_key in {start_key, stop_key}:
+            document_now_key = next(
+                (key for key in self.connector_key_choices() if key not in {start_key, stop_key}),
+                "F8",
+            )
+            self.connector_document_now_key_var.set(document_now_key)
+        connector_config = self.config.setdefault("connector", {})
+        connector_config["enabled"] = bool(self.connector_enabled_var.get())
+        connector_config["start_key"] = start_key
+        connector_config["stop_key"] = stop_key
+        connector_config["document_now_key"] = document_now_key
+        connector_config.setdefault("stop_transcription_grace_seconds", 2)
+        connector_config.setdefault("auto_return_home", True)
+
+    def capture_fly_dictation_settings(self) -> None:
+        if not hasattr(self, "fly_dictation_enabled_var"):
+            return
+        settings = self.get_fly_dictation_settings()
+        self.fly_dictation_key_var.set(settings["key"])
+        self.fly_dictation_model_var.set(settings["model"])
+        self.fly_dictation_device_var.set(settings["device"])
+        self.fly_dictation_compute_var.set(settings["compute_type"])
+        fly_config = self.config.setdefault("fly_dictation", {})
+        fly_config["enabled"] = settings["enabled"]
+        fly_config["key"] = settings["key"]
+        fly_config["model"] = settings["model"]
+        fly_config["device"] = settings["device"]
+        fly_config["compute_type"] = settings["compute_type"]
+        fly_config.setdefault("min_seconds", settings["min_seconds"])
+        fly_config.setdefault("paste_delay_ms", settings["paste_delay_ms"])
+        fly_config.setdefault("beam_size", 1)
+        fly_config.setdefault("best_of", 1)
+        fly_config.setdefault("temperature", 0.0)
+        fly_config.setdefault("condition_on_previous_text", False)
+        fly_config.setdefault("vad_filter", False)
+        fly_config.setdefault("without_timestamps", True)
+        fly_config.setdefault("max_new_tokens", 128)
+        fly_config.setdefault("min_silence_duration_ms", 250)
+        fly_config.setdefault("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
+        fly_config.setdefault("preload_model", True)
+
+    def capture_all_runtime_settings(self) -> None:
+        self.capture_message_composition_settings()
+        self.capture_ui_selection_settings()
+        self.capture_pdf_selection_settings()
+        self.capture_prompt_selection_settings()
+        self.capture_document_now_default_prompt_setting()
+        self.capture_context_delay_setting()
+        self.capture_connector_settings()
+        self.capture_fly_dictation_settings()
+        self.capture_stt_runtime_settings()
+        medical = self.config.setdefault("medical_transcription", {})
+        if hasattr(self, "whisper_include_weda_context_var"):
+            medical["include_weda_context_in_whisper_prompt"] = bool(self.whisper_include_weda_context_var.get())
+            medical["use_dynamic_weda_hotwords"] = bool(self.whisper_use_dynamic_hotwords_var.get())
+            medical["apply_validated_corrections"] = bool(self.whisper_apply_corrections_var.get())
+        if hasattr(self, "permanent_hotwords_text"):
+            medical["permanent_hotwords"] = parse_permanent_hotwords(self.get_text(self.permanent_hotwords_text))
+
+    def save_all_runtime_settings(self, reason: str = "settings") -> bool:
+        self.capture_all_runtime_settings()
+        return self.write_runtime_config(reason)
+
+    def save_message_composition_settings(self) -> None:
+        self.capture_message_composition_settings()
+        message_config = self.config.setdefault("message_composition", {})
         try:
             save_json(BASE_DIR / "config.json", self.config)
         except Exception as exc:
@@ -2720,9 +3809,18 @@ class AssistantApp:
     def build_lmstudio_message(self) -> tuple[str, dict[str, str]]:
         prompt_content = self.get_text(self.prompt_text) if self.include_prompt_var.get() else ""
         variables = self.build_prompt_variables()
-        message = self.prompt_manager.render_prompt(prompt_content, variables) if prompt_content.strip() else ""
-        message = self.append_missing_source_sections(prompt_content, message, variables)
-        message = self.append_message_attachment_section(prompt_content, message, variables)
+        def render_message(working_variables: dict[str, str]) -> str:
+            rendered = self.prompt_manager.render_prompt(prompt_content, working_variables) if prompt_content.strip() else ""
+            rendered = self.append_missing_source_sections(prompt_content, rendered, working_variables)
+            rendered = self.append_message_attachment_section(prompt_content, rendered, working_variables)
+            return rendered
+
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_content,
+            variables,
+            render_message,
+            label="message_principal",
+        )
         return message, variables
 
     def refresh_sent_message(self) -> str:
@@ -2774,12 +3872,33 @@ class AssistantApp:
         variables["document_label"] = f"Document {document_index}"
         variables["prompt_name"] = self.document_prompt_name(document_index)
 
-        message = self.prompt_manager.render_prompt(prompt_content, variables) if prompt_content.strip() else ""
-        message = self.append_missing_source_sections(prompt_content, message, variables)
-        message = self.append_message_attachment_section(prompt_content, message, variables)
+        def render_message(working_variables: dict[str, str]) -> str:
+            rendered = self.prompt_manager.render_prompt(prompt_content, working_variables) if prompt_content.strip() else ""
+            rendered = self.append_missing_source_sections(prompt_content, rendered, working_variables)
+            rendered = self.append_message_attachment_section(prompt_content, rendered, working_variables)
+            return rendered
+
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_content,
+            variables,
+            render_message,
+            label=f"document_{document_index}",
+        )
         return message, variables
 
     def send_document_to_lmstudio(self, document_index: int) -> None:
+        if document_index == 1:
+            # Document 1 is the entry point of the optional 1 -> 2 -> 3 chain.
+            # Keep every "Envoyer" button on the same orchestration path.
+            self.send_to_lmstudio()
+            return
+        if self.is_lmstudio_request_active(f"document_{document_index}"):
+            self.document_status_var(document_index).set(f"Document {document_index}: génération déjà en cours")
+            return
+        if self.include_context_var.get() and not self.require_fresh_patient_context(
+            f"Génération du Document {document_index}"
+        ):
+            return
         try:
             message, variables = self.build_independent_document_lmstudio_message(document_index)
         except Exception as exc:
@@ -2802,6 +3921,7 @@ class AssistantApp:
         self.lmstudio_status_var.set(f"LM Studio: Document {document_index} en cours")
         lm_config = self.config.get("lmstudio", {})
         client = self.build_lmstudio_client()
+        self.adjust_lmstudio_client_for_context(client, message, label=f"document_{document_index}")
         self.start_lmstudio_spinner(self.document_lmstudio_spinner_key(document_index))
         self.log_debug(
             "info",
@@ -2820,20 +3940,31 @@ class AssistantApp:
             },
         )
 
-        def worker():
-            try:
-                response = client.chat(message)
-                self.root.after(0, self.on_document_lmstudio_response, document_index, response, message)
-            except Exception as exc:
-                self.root.after(0, self.on_document_lmstudio_error, document_index, exc, message)
-
-        threading.Thread(target=worker, name=f"lmstudio-document-{document_index}-request", daemon=True).start()
+        self.launch_lmstudio_request(
+            f"document_{document_index}",
+            client,
+            message,
+            on_success=lambda response: self.on_document_lmstudio_response(document_index, response, message),
+            on_error=lambda error: self.on_document_lmstudio_error(document_index, error, message),
+            thread_name=f"lmstudio-document-{document_index}-request",
+            result_source=self.result_source_key_for_document(document_index),
+        )
 
     def on_document_lmstudio_response(self, document_index: int, response, sent_message: str) -> None:
         self.stop_lmstudio_spinner(self.document_lmstudio_spinner_key(document_index))
         result_text = self.apply_abbreviations_to_lmstudio_result(response.text, f"Résultat {document_index}")
+        result_source = self.result_source_key_for_document(document_index)
+        result_payload = self.remember_weda_result_payload(result_source, result_text)
+        self.record_generation_metric(
+            f"document_{document_index}",
+            result_source,
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message or ""),
+            result_chars=len(result_payload.text or ""),
+        )
         result_widget = self.document_result_widget(document_index)
-        self.set_text(result_widget, result_text)
+        self.set_rich_result_text(result_widget, result_payload, source=result_source)
         self.select_tab_containing_widget(result_widget)
         self.document_status_var(document_index).set(f"Document {document_index}: réponse reçue en {response.elapsed_seconds:.1f}s")
         self.lmstudio_status_var.set(f"LM Studio: Document {document_index} reçu en {response.elapsed_seconds:.1f}s")
@@ -2846,7 +3977,8 @@ class AssistantApp:
                 "document_index": document_index,
                 "elapsed_seconds": response.elapsed_seconds,
                 "raw_result_length": len(response.text or ""),
-                "result_length": len(result_text or ""),
+                "result_length": len(result_payload.text or ""),
+                "result_html_length": len(result_payload.html or ""),
             },
         )
         if document_index == 1:
@@ -2854,10 +3986,30 @@ class AssistantApp:
             self.schedule_tertiary_message_refresh()
         elif document_index == 2:
             self.schedule_tertiary_message_refresh()
-        self.append_independent_document_history(document_index, sent_message, result_text)
+        self.append_independent_document_history(document_index, sent_message, result_payload.text)
 
     def on_document_lmstudio_error(self, document_index: int, error: Exception, sent_message: str) -> None:
         self.stop_lmstudio_spinner(self.document_lmstudio_spinner_key(document_index))
+        self.discard_pending_result_patient_binding(self.result_source_key_for_document(document_index))
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric(
+                f"document_{document_index}",
+                self.result_source_key_for_document(document_index),
+                status="cancelled",
+                input_chars=len(sent_message or ""),
+                error=error,
+            )
+            self.document_status_var(document_index).set(f"Document {document_index}: génération annulée")
+            self.lmstudio_status_var.set("LM Studio: génération annulée")
+            self.log_debug("info", "app", "lmstudio_document_cancelled", str(error), {"document_index": document_index})
+            return
+        self.record_generation_metric(
+            f"document_{document_index}",
+            self.result_source_key_for_document(document_index),
+            status="error",
+            input_chars=len(sent_message or ""),
+            error=error,
+        )
         message = f"Erreur Document {document_index} : {error}"
         result_widget = self.document_result_widget(document_index)
         self.set_text(result_widget, message)
@@ -2922,9 +4074,10 @@ class AssistantApp:
     ) -> DocumentNowSnapshot:
         prompt_id = self.current_document_now_prompt_id()
         prompt = self.prompt_manager.get(prompt_id) if prompt_id else None
-        prompt_content = self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
+        selected_prompt_content = self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
             prompt.content if prompt else DEFAULT_DOCUMENT_NOW_PROMPT
         )
+        prompt_content = self.compose_document_now_prompt_content(selected_prompt_content)
         audio_stats = getattr(result, "audio_stats", {}) or {}
         duration_seconds = audio_stats.get("duration_seconds")
         try:
@@ -2980,6 +4133,8 @@ class AssistantApp:
                 "document_type": snapshot.document_type or "document_intermediaire",
                 "document_label": "Document maintenant",
                 "prompt_name": snapshot.prompt_name or "",
+                "document_now_default_prompt": self.get_document_now_default_prompt_prefix(),
+                "prompt_defaut_document_maintenant": self.get_document_now_default_prompt_prefix(),
                 "transcript_segment_count": "" if snapshot.transcript_segment_count is None else str(snapshot.transcript_segment_count),
                 "transcript_duration_seconds": (
                     "" if snapshot.transcript_duration_seconds is None else f"{snapshot.transcript_duration_seconds:.1f}"
@@ -3035,20 +4190,30 @@ class AssistantApp:
             f"preview-{uuid.uuid4().hex[:8]}",
             status="preview",
         )
-        prompt_content = (
+        selected_prompt_content = (
             self.get_text(self.document_now_prompt_text) if hasattr(self, "document_now_prompt_text") else (
                 snapshot.prompt_content or DEFAULT_DOCUMENT_NOW_PROMPT
             )
         ) if self.include_prompt_var.get() else ""
+        prompt_content = self.compose_document_now_prompt_content(selected_prompt_content) if self.include_prompt_var.get() else ""
         prompt_id = self.current_document_now_prompt_id()
         prompt = self.prompt_manager.get(prompt_id) if prompt_id else None
         snapshot.prompt_id = prompt.id if prompt else prompt_id or snapshot.prompt_id
         snapshot.prompt_name = prompt.name if prompt else self.document_now_prompt_var.get() or snapshot.prompt_name
         snapshot.prompt_content = prompt_content
         variables = self.build_document_now_prompt_variables(snapshot)
-        message = self.prompt_manager.render_prompt(prompt_content, variables) if prompt_content.strip() else ""
-        message = self.append_missing_document_now_sections(prompt_content, message, variables)
-        message = self.append_message_attachment_section(prompt_content, message, variables)
+        def render_message(working_variables: dict[str, str]) -> str:
+            rendered = self.prompt_manager.render_prompt(prompt_content, working_variables) if prompt_content.strip() else ""
+            rendered = self.append_missing_document_now_sections(prompt_content, rendered, working_variables)
+            rendered = self.append_message_attachment_section(prompt_content, rendered, working_variables)
+            return rendered
+
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_content,
+            variables,
+            render_message,
+            label="document_maintenant",
+        )
         return message, variables, snapshot
 
     def refresh_document_now_sent_message(self) -> str:
@@ -3080,6 +4245,10 @@ class AssistantApp:
         if self.document_now_running:
             self.document_now_status_var.set("Document maintenant: génération déjà en cours")
             return
+        if self.context_manager.get_latest() is not None and not self.require_fresh_patient_context(
+            "Document maintenant"
+        ):
+            return
         if self.document_now_pending_checkpoints:
             self.document_now_status_var.set("Document maintenant: checkpoint déjà en attente de transcription")
             return
@@ -3107,6 +4276,76 @@ class AssistantApp:
         snapshot = self.create_document_now_snapshot(checkpoint_id, status="snapshot_ready")
         self.run_document_now_snapshot(snapshot, trigger="no_active_recording")
 
+    def request_connector_document_now_checkpoint(
+        self,
+        job_id: str,
+        *,
+        expected_patient_id: str = "",
+    ) -> None:
+        if self.document_now_running:
+            raise RuntimeError("Une génération « Document maintenant » est déjà en cours.")
+        if self.document_now_pending_checkpoints:
+            raise RuntimeError("Un checkpoint « Document maintenant » est déjà en attente.")
+        context = self.context_manager.get_latest()
+        if (
+            context is not None
+            and expected_patient_id
+            and context.patient_id
+            and not patient_ids_match(context.patient_id, expected_patient_id)
+        ):
+            raise RuntimeError(
+                "Le patient WEDA actif ne correspond pas au contexte chargé dans DrFloW."
+            )
+        if context is not None and not self.require_fresh_patient_context(
+            "Document maintenant depuis WEDA"
+        ):
+            raise RuntimeError("Le contexte patient WEDA doit être confirmé avant la génération.")
+
+        checkpoint_id = f"connector-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self.document_now_pending_checkpoints[checkpoint_id] = {
+            "created_at": time.time(),
+            "trigger": "connector_weda",
+            "connector_job_id": job_id,
+        }
+        self.set_document_now_connector_job(
+            {
+                "status": "waiting_transcription",
+                "message": "Création du snapshot de transcription.",
+                "snapshot_id": checkpoint_id,
+            },
+            job_id=job_id,
+        )
+        self.document_now_status_var.set("Document maintenant: demande reçue depuis WEDA")
+        self.log_debug(
+            "info",
+            "connector",
+            "connector_document_now_checkpoint_requested",
+            "Checkpoint Document maintenant demandé depuis WEDA.",
+            {
+                "job_id": job_id,
+                "checkpoint_id": checkpoint_id,
+                "session_running": bool(self.session and self.session.is_running()),
+                "transcription_length": len(self.get_clean_transcription_text()),
+            },
+        )
+
+        if self.session and self.session.is_running() and self.session.request_checkpoint(checkpoint_id):
+            self.transcription_status_var.set("Checkpoint WEDA Document maintenant: segment en transcription")
+            return
+
+        self.document_now_pending_checkpoints.pop(checkpoint_id, None)
+        snapshot = self.create_document_now_snapshot(checkpoint_id, status="snapshot_ready")
+        self.set_document_now_connector_job(
+            {
+                "status": "generating",
+                "message": "Génération de « Document maintenant » par LM Studio.",
+            },
+            job_id=job_id,
+        )
+        self.run_document_now_snapshot(snapshot, trigger="connector_weda_no_active_recording")
+        if snapshot.status != "generating":
+            raise RuntimeError(snapshot.error or "La génération « Document maintenant » n’a pas pu démarrer.")
+
     def send_document_now_from_message_tab(self) -> None:
         if self.document_now_current_snapshot:
             self.regenerate_document_now_from_snapshot()
@@ -3118,9 +4357,29 @@ class AssistantApp:
         if not checkpoint_ids:
             return
         for checkpoint_id in checkpoint_ids:
-            self.document_now_pending_checkpoints.pop(checkpoint_id, None)
+            checkpoint = self.document_now_pending_checkpoints.pop(checkpoint_id, None) or {}
             snapshot = self.create_document_now_snapshot(checkpoint_id, result, status="snapshot_ready")
-            self.run_document_now_snapshot(snapshot, trigger="checkpoint_flush")
+            connector_job_id = str(checkpoint.get("connector_job_id") or "")
+            if connector_job_id:
+                self.set_document_now_connector_job(
+                    {
+                        "status": "generating",
+                        "message": "Génération de « Document maintenant » par LM Studio.",
+                        "snapshot_id": checkpoint_id,
+                    },
+                    job_id=connector_job_id,
+                )
+            trigger = str(checkpoint.get("trigger") or "checkpoint_flush")
+            self.run_document_now_snapshot(snapshot, trigger=trigger)
+            if connector_job_id and snapshot.status != "generating":
+                self.set_document_now_connector_job(
+                    {
+                        "status": "error",
+                        "message": snapshot.error or "La génération « Document maintenant » n’a pas pu démarrer.",
+                        "error": snapshot.error or "document_now_start_failed",
+                    },
+                    job_id=connector_job_id,
+                )
 
     def run_document_now_snapshot(self, snapshot: DocumentNowSnapshot, *, trigger: str = "manual") -> None:
         if self.document_now_running:
@@ -3166,6 +4425,7 @@ class AssistantApp:
         self.select_tab_containing_widget(self.document_now_sent_message_text)
         lm_config = self.config.get("lmstudio", {})
         client = self.build_lmstudio_client()
+        self.adjust_lmstudio_client_for_context(client, message, label="document_maintenant")
         self.log_debug(
             "info",
             "app",
@@ -3183,14 +4443,15 @@ class AssistantApp:
             },
         )
 
-        def worker():
-            try:
-                response = client.chat(message)
-                self.root.after(0, self.on_document_now_response, snapshot.id, response, message)
-            except Exception as exc:
-                self.root.after(0, self.on_document_now_error, snapshot.id, exc, message)
-
-        threading.Thread(target=worker, name="lmstudio-document-now-request", daemon=True).start()
+        self.launch_lmstudio_request(
+            "document_now",
+            client,
+            message,
+            on_success=lambda response: self.on_document_now_response(snapshot.id, response, message),
+            on_error=lambda error: self.on_document_now_error(snapshot.id, error, message),
+            thread_name="lmstudio-document-now-request",
+            result_source="document_now",
+        )
 
     def configure_document_now_button_state(self) -> None:
         if hasattr(self, "document_now_button"):
@@ -3200,8 +4461,17 @@ class AssistantApp:
         self.stop_lmstudio_spinner(DOCUMENT_NOW_SPINNER_KEY)
         snapshot = self.document_now_snapshots.get(snapshot_id) or self.document_now_current_snapshot
         result_text = self.apply_abbreviations_to_lmstudio_result(response.text, "Document maintenant")
+        result_payload = self.remember_weda_result_payload("document_now", result_text)
+        self.record_generation_metric(
+            "document_now",
+            "document_now",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message or ""),
+            result_chars=len(result_payload.text or ""),
+        )
         if snapshot:
-            snapshot.result = result_text
+            snapshot.result = result_payload.text
             snapshot.sent_message = sent_message
             snapshot.status = "done"
             snapshot.error = None
@@ -3209,7 +4479,7 @@ class AssistantApp:
             self.document_now_current_snapshot = snapshot
         self.document_now_running = False
         self.configure_document_now_button_state()
-        self.set_text(self.document_now_result_text, result_text)
+        self.set_rich_result_text(self.document_now_result_text, result_payload, source="document_now")
         self.select_tab_containing_widget(self.document_now_result_text)
         self.document_now_status_var.set(f"Document maintenant: reçu en {response.elapsed_seconds:.1f}s")
         self.lmstudio_status_var.set(f"LM Studio: Document maintenant reçu en {response.elapsed_seconds:.1f}s")
@@ -3222,15 +4492,47 @@ class AssistantApp:
                 "checkpoint_id": snapshot_id,
                 "elapsed_seconds": response.elapsed_seconds,
                 "raw_result_length": len(response.text or ""),
-                "result_length": len(result_text or ""),
+                "result_length": len(result_payload.text or ""),
+                "result_html_length": len(result_payload.html or ""),
             },
         )
+        self.finalize_document_now_connector_result(
+            snapshot_id,
+            result_payload,
+            elapsed_seconds=response.elapsed_seconds,
+        )
         if snapshot:
-            self.append_document_now_history(snapshot, sent_message, result_text)
+            self.append_document_now_history(snapshot, sent_message, result_payload.text)
 
     def on_document_now_error(self, snapshot_id: str, error: Exception, sent_message: str) -> None:
         self.stop_lmstudio_spinner(DOCUMENT_NOW_SPINNER_KEY)
+        self.discard_pending_result_patient_binding("document_now")
         snapshot = self.document_now_snapshots.get(snapshot_id) or self.document_now_current_snapshot
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric(
+                "document_now",
+                "document_now",
+                status="cancelled",
+                input_chars=len(sent_message or ""),
+                error=error,
+            )
+            if snapshot:
+                snapshot.status = "cancelled"
+                snapshot.error = str(error)
+            self.document_now_running = False
+            self.configure_document_now_button_state()
+            self.document_now_status_var.set("Document maintenant: génération annulée")
+            self.lmstudio_status_var.set("LM Studio: génération annulée")
+            self.log_debug("info", "app", "document_now_lmstudio_cancelled", str(error))
+            self.fail_document_now_connector_job(snapshot_id, error)
+            return
+        self.record_generation_metric(
+            "document_now",
+            "document_now",
+            status="error",
+            input_chars=len(sent_message or ""),
+            error=error,
+        )
         message = f"Erreur Document maintenant : {error}"
         if snapshot:
             snapshot.sent_message = sent_message
@@ -3254,7 +4556,89 @@ class AssistantApp:
                 "message_length": len(sent_message or ""),
             },
         )
+        self.fail_document_now_connector_job(snapshot_id, error)
         messagebox.showerror("Document maintenant", str(error), parent=self.root)
+
+    def finalize_document_now_connector_result(
+        self,
+        snapshot_id: str,
+        result_payload: RichTextPayload,
+        *,
+        elapsed_seconds: float,
+    ) -> bool:
+        job = self.get_document_now_connector_job()
+        if not job or job.get("snapshot_id") != snapshot_id:
+            return False
+        try:
+            copied = bool(self.copy_rich_result_source("document_now"))
+        except Exception as exc:
+            copied = False
+            copy_error = str(exc)
+        else:
+            copy_error = ""
+
+        if copied:
+            self.set_document_now_connector_job(
+                {
+                    "status": "ready",
+                    "message": "Document maintenant prêt à être collé.",
+                    "clipboard_copied": True,
+                    "result_length": len(result_payload.text or ""),
+                    "result_html_length": len(result_payload.html or ""),
+                    "elapsed_seconds": elapsed_seconds,
+                },
+                job_id=str(job.get("id") or ""),
+            )
+            self.document_now_status_var.set("Document maintenant: copié, prêt à coller dans WEDA")
+            self.log_debug(
+                "info",
+                "connector",
+                "connector_document_now_ready",
+                "Document maintenant généré et copié dans le presse-papiers.",
+                {
+                    "job_id": job.get("id"),
+                    "checkpoint_id": snapshot_id,
+                    "result_length": len(result_payload.text or ""),
+                    "result_html_length": len(result_payload.html or ""),
+                    "elapsed_seconds": elapsed_seconds,
+                },
+            )
+            return True
+
+        error_message = copy_error or "La copie automatique dans le presse-papiers a échoué."
+        self.set_document_now_connector_job(
+            {
+                "status": "error",
+                "message": error_message,
+                "error": error_message,
+                "clipboard_copied": False,
+            },
+            job_id=str(job.get("id") or ""),
+        )
+        self.document_now_status_var.set("Document maintenant: copie automatique impossible")
+        self.log_debug(
+            "error",
+            "connector",
+            "connector_document_now_clipboard_error",
+            error_message,
+            {"job_id": job.get("id"), "checkpoint_id": snapshot_id},
+        )
+        return False
+
+    def fail_document_now_connector_job(self, snapshot_id: str, error: Exception | str) -> None:
+        job = self.get_document_now_connector_job()
+        if not job or job.get("snapshot_id") != snapshot_id:
+            return
+        message = str(error or "Erreur de génération « Document maintenant ».")
+        self.set_document_now_connector_job(
+            {
+                "status": "error",
+                "message": message,
+                "error": message,
+                "clipboard_copied": False,
+            },
+            job_id=str(job.get("id") or ""),
+        )
 
     def append_document_now_history(
         self,
@@ -3296,11 +4680,15 @@ class AssistantApp:
         self.run_document_now_snapshot(snapshot, trigger="regenerate_same_snapshot")
 
     def copy_document_now_result(self) -> None:
-        ok = copy_text_to_clipboard(self.get_text(self.document_now_result_text), self.root)
-        self.document_now_status_var.set("Document maintenant: résultat copié" if ok else "Document maintenant: copie impossible")
+        ok = self.copy_rich_result_source("document_now")
+        self.document_now_status_var.set("Document maintenant: résultat WEDA copié" if ok else "Document maintenant: copie impossible")
 
     def clear_document_now_result(self) -> None:
         self.set_text(self.document_now_result_text, "")
+        self.rich_result_payloads.pop("document_now", None)
+        self.result_patient_bindings.pop("document_now", None)
+        self.generated_result_originals.pop("document_now", None)
+        self.result_generation_metadata.pop("document_now", None)
         if self.document_now_current_snapshot:
             self.document_now_current_snapshot.result = None
             self.document_now_current_snapshot.status = "cleared"
@@ -3332,10 +4720,10 @@ class AssistantApp:
         if missing:
             raise RuntimeError("Variable(s) inconnue(s) dans Prompt 2 : " + ", ".join(missing))
 
-        if self.include_prompt_var.get():
-            message = self.prompt_manager.render_prompt(prompt_2_content, variables)
-            message = append_missing_secondary_sections(prompt_2_content, message, variables)
-        else:
+        def render_message(working_variables: dict[str, str]) -> str:
+            if self.include_prompt_var.get():
+                rendered = self.prompt_manager.render_prompt(prompt_2_content, working_variables)
+                return append_missing_secondary_sections(prompt_2_content, rendered, working_variables)
             source_sections = []
             for variable_name, title in (
                 ("current_date", "DATE DU JOUR"),
@@ -3344,11 +4732,21 @@ class AssistantApp:
                 ("transcription", "TRANSCRIPTION INITIALE"),
                 ("result_1", "RÉSULTAT 1"),
             ):
-                value = str(variables.get(variable_name) or "").strip()
+                value = str(working_variables.get(variable_name) or "").strip()
                 if value:
                     source_sections.append(f"{title} :\n{value}")
-            message = "\n\n".join(source_sections)
-        message = self.append_message_attachment_section(prompt_2_content, message, variables)
+            return "\n\n".join(source_sections)
+
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_2_content,
+            variables,
+            lambda working_variables: self.append_message_attachment_section(
+                prompt_2_content,
+                render_message(working_variables),
+                working_variables,
+            ),
+            label="prompt_2",
+        )
         if not message.strip():
             raise RuntimeError("Message Prompt 2 vide après résolution des variables.")
         return message, variables
@@ -3397,10 +4795,10 @@ class AssistantApp:
         if missing:
             raise RuntimeError("Variable(s) inconnue(s) dans Prompt 3 : " + ", ".join(missing))
 
-        if self.include_prompt_var.get():
-            message = self.prompt_manager.render_prompt(prompt_3_content, variables)
-            message = append_missing_tertiary_sections(prompt_3_content, message, variables)
-        else:
+        def render_message(working_variables: dict[str, str]) -> str:
+            if self.include_prompt_var.get():
+                rendered = self.prompt_manager.render_prompt(prompt_3_content, working_variables)
+                return append_missing_tertiary_sections(prompt_3_content, rendered, working_variables)
             source_sections = []
             for variable_name, title in (
                 ("current_date", "DATE DU JOUR"),
@@ -3410,11 +4808,21 @@ class AssistantApp:
                 ("result_1", "RÉSULTAT 1"),
                 ("result_2", "RÉSULTAT 2"),
             ):
-                value = str(variables.get(variable_name) or "").strip()
+                value = str(working_variables.get(variable_name) or "").strip()
                 if value:
                     source_sections.append(f"{title} :\n{value}")
-            message = "\n\n".join(source_sections)
-        message = self.append_message_attachment_section(prompt_3_content, message, variables)
+            return "\n\n".join(source_sections)
+
+        message, variables = self.apply_lmstudio_context_limit(
+            prompt_3_content,
+            variables,
+            lambda working_variables: self.append_message_attachment_section(
+                prompt_3_content,
+                render_message(working_variables),
+                working_variables,
+            ),
+            label="prompt_3",
+        )
         if not message.strip():
             raise RuntimeError("Message Prompt 3 vide après résolution des variables.")
         return message, variables
@@ -3441,6 +4849,207 @@ class AssistantApp:
                 except tk.TclError:
                     pass
             current = parent
+
+    def install_text_search_shortcuts(self) -> None:
+        self.root.bind_all("<Control-f>", self.open_text_search, add="+")
+        self.root.bind_all("<Control-F>", self.open_text_search, add="+")
+
+    def open_text_search(self, event=None):
+        self.ensure_text_search_window()
+        selected_text = self.get_active_text_selection_for_search()
+        if selected_text:
+            self.text_search_query_var.set(selected_text)
+        if self.text_search_window is not None:
+            self.text_search_window.deiconify()
+            self.text_search_window.lift()
+        if hasattr(self, "text_search_entry"):
+            self.text_search_entry.focus_set()
+            self.text_search_entry.select_range(0, tk.END)
+        self.refresh_text_search_matches()
+        return "break"
+
+    def ensure_text_search_window(self) -> None:
+        if self.text_search_window is not None and self.text_search_window.winfo_exists():
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Recherche")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.close_text_search)
+
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Rechercher").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        self.text_search_entry = ttk.Entry(frame, textvariable=self.text_search_query_var, width=42)
+        self.text_search_entry.grid(row=0, column=1, columnspan=3, sticky=tk.EW)
+        self.text_search_entry.bind("<KeyRelease>", self.on_text_search_entry_key_release)
+        self.text_search_entry.bind("<Return>", self.goto_next_text_search_match_event)
+        self.text_search_entry.bind("<Shift-Return>", self.goto_previous_text_search_match_event)
+
+        ttk.Button(frame, text="Précédent", command=self.goto_previous_text_search_match).grid(row=1, column=1, sticky=tk.EW, pady=(8, 0), padx=(0, 6))
+        ttk.Button(frame, text="Suivant", command=self.goto_next_text_search_match).grid(row=1, column=2, sticky=tk.EW, pady=(8, 0), padx=(0, 6))
+        ttk.Button(frame, text="Fermer", command=self.close_text_search).grid(row=1, column=3, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(frame, textvariable=self.text_search_status_var).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+        frame.columnconfigure(1, weight=1)
+        window.bind("<Escape>", self.close_text_search)
+        self.text_search_window = window
+
+    def close_text_search(self, event=None):
+        self.clear_text_search_highlights()
+        if self.text_search_window is not None and self.text_search_window.winfo_exists():
+            self.text_search_window.withdraw()
+        return "break"
+
+    def on_text_search_entry_key_release(self, event=None) -> None:
+        ignored_keys = {"Return", "Escape", "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}
+        if event is not None and getattr(event, "keysym", "") in ignored_keys:
+            return
+        self.refresh_text_search_matches()
+
+    def goto_next_text_search_match_event(self, event=None):
+        self.goto_next_text_search_match()
+        return "break"
+
+    def goto_previous_text_search_match_event(self, event=None):
+        self.goto_previous_text_search_match()
+        return "break"
+
+    def get_active_text_selection_for_search(self) -> str:
+        try:
+            focused = self.root.focus_get()
+        except tk.TclError:
+            focused = None
+        if not isinstance(focused, tk.Text):
+            return ""
+        try:
+            selected = focused.get("sel.first", "sel.last")
+        except tk.TclError:
+            return ""
+        return re.sub(r"\s+", " ", selected).strip()[:120]
+
+    def get_searchable_text_widgets(self) -> list[tk.Text]:
+        widgets: list[tk.Text] = []
+
+        def visit(widget: tk.Widget) -> None:
+            try:
+                if isinstance(widget, tk.Text):
+                    widgets.append(widget)
+                for child in widget.winfo_children():
+                    visit(child)
+            except tk.TclError:
+                return
+
+        visit(self.root)
+        return widgets
+
+    def configure_text_search_tags(self, widget: tk.Text) -> None:
+        try:
+            widget.tag_configure(TEXT_SEARCH_MATCH_TAG, background="#334155", foreground="#f8fafc")
+            widget.tag_configure(TEXT_SEARCH_CURRENT_TAG, background="#facc15", foreground="#111827")
+            widget.tag_raise(TEXT_SEARCH_CURRENT_TAG, TEXT_SEARCH_MATCH_TAG)
+        except tk.TclError:
+            pass
+
+    def clear_text_search_highlights(self) -> None:
+        for widget in self.get_searchable_text_widgets():
+            try:
+                widget.tag_remove(TEXT_SEARCH_MATCH_TAG, "1.0", tk.END)
+                widget.tag_remove(TEXT_SEARCH_CURRENT_TAG, "1.0", tk.END)
+            except tk.TclError:
+                continue
+        self.text_search_matches = []
+        self.text_search_current_index = -1
+
+    def clear_current_text_search_highlight(self) -> None:
+        for widget in self.get_searchable_text_widgets():
+            try:
+                widget.tag_remove(TEXT_SEARCH_CURRENT_TAG, "1.0", tk.END)
+            except tk.TclError:
+                continue
+
+    def refresh_text_search_matches(self) -> None:
+        query = self.text_search_query_var.get()
+        self.clear_text_search_highlights()
+        if not query:
+            self.text_search_status_var.set("Saisir un terme à rechercher.")
+            return
+
+        for widget in self.get_searchable_text_widgets():
+            self.configure_text_search_tags(widget)
+            start = "1.0"
+            while True:
+                try:
+                    match_start = widget.search(query, start, stopindex=tk.END, nocase=True, regexp=False)
+                except tk.TclError:
+                    break
+                if not match_start:
+                    break
+                match_end = f"{match_start}+{len(query)}c"
+                try:
+                    widget.tag_add(TEXT_SEARCH_MATCH_TAG, match_start, match_end)
+                except tk.TclError:
+                    break
+                self.text_search_matches.append((widget, match_start, match_end))
+                start = match_end
+
+        if not self.text_search_matches:
+            self.text_search_status_var.set(f"Aucun résultat pour « {query} ».")
+            return
+
+        self.goto_text_search_match(0)
+
+    def goto_next_text_search_match(self) -> None:
+        if not self.text_search_matches:
+            self.refresh_text_search_matches()
+            return
+        self.goto_text_search_match(self.text_search_current_index + 1)
+
+    def goto_previous_text_search_match(self) -> None:
+        if not self.text_search_matches:
+            self.refresh_text_search_matches()
+            return
+        index = self.text_search_current_index - 1
+        if self.text_search_current_index < 0:
+            index = len(self.text_search_matches) - 1
+        self.goto_text_search_match(index)
+
+    def goto_text_search_match(self, index: int) -> None:
+        if not self.text_search_matches:
+            self.text_search_status_var.set("Aucun résultat.")
+            return
+
+        match_index = index % len(self.text_search_matches)
+        widget, start, end = self.text_search_matches[match_index]
+        self.clear_current_text_search_highlight()
+        try:
+            self.configure_text_search_tags(widget)
+            widget.tag_add(TEXT_SEARCH_CURRENT_TAG, start, end)
+            self.select_tab_containing_widget(widget)
+            widget.see(start)
+            widget.mark_set(tk.INSERT, end)
+        except tk.TclError:
+            self.refresh_text_search_matches()
+            return
+
+        self.text_search_current_index = match_index
+        label = self.get_text_search_widget_label(widget)
+        self.text_search_status_var.set(f"Résultat {match_index + 1}/{len(self.text_search_matches)} - {label}")
+
+    def get_text_search_widget_label(self, widget: tk.Widget) -> str:
+        labels: list[str] = []
+        current = widget
+        while current is not None:
+            parent = current.master
+            if isinstance(parent, ttk.Notebook):
+                try:
+                    label = str(parent.tab(current, "text") or "").strip()
+                    if label:
+                        labels.append(label)
+                except tk.TclError:
+                    pass
+            current = parent
+        return " > ".join(reversed(labels)) or "champ texte"
 
     def call_ui_sync(self, func, *, timeout_seconds: float = 10.0):
         if threading.get_ident() == self.main_thread_id:
@@ -3479,6 +5088,11 @@ class AssistantApp:
                 connector_start_handler=self.connector_start,
                 connector_stop_handler=self.connector_stop,
                 connector_status_provider=self.get_connector_job,
+                connector_document_now_handler=self.connector_document_now,
+                connector_document_now_status_provider=self.get_document_now_connector_job,
+                context_refresh_provider=self.get_weda_context_refresh_request,
+                context_refresh_claim_handler=self.claim_weda_context_refresh,
+                context_refresh_ack_handler=self.acknowledge_weda_context_refresh,
                 fly_dictation_start_handler=self.fly_dictation_start,
                 fly_dictation_stop_handler=self.fly_dictation_stop,
                 fly_dictation_status_provider=self.get_fly_dictation_state,
@@ -3552,6 +5166,27 @@ class AssistantApp:
             except Exception:
                 pass
 
+    def ensure_medical_transcription_config(self) -> None:
+        changed = False
+        target = self.config.setdefault("medical_transcription", {})
+        for key, value in DEFAULT_MEDICAL_TRANSCRIPTION_CONFIG.items():
+            if key not in target:
+                target[key] = list(value) if isinstance(value, list) else value
+                changed = True
+        for section_name in ("whisper", "faster_whisper"):
+            section = self.config.setdefault(section_name, {})
+            if float(section.get("segment_seconds") or 15) == 15:
+                section["segment_seconds"] = TRANSCRIPTION_WINDOW_SECONDS
+                changed = True
+            if float(section.get("overlap_seconds") or 1) == 1:
+                section["overlap_seconds"] = TRANSCRIPTION_OVERLAP_SECONDS
+                changed = True
+        if changed:
+            try:
+                save_json(BASE_DIR / "config.json", self.config)
+            except Exception:
+                pass
+
     def ensure_whisper_initial_prompts(self) -> None:
         if self.whisper_initial_prompt_manager.list_prompts():
             return
@@ -3587,6 +5222,128 @@ class AssistantApp:
 
     def selected_stt_engine_id(self) -> str:
         return normalize_engine_id(self.stt_engine_var.get() if hasattr(self, "stt_engine_var") else FASTER_WHISPER_ENGINE_ID)
+
+    def normalize_whisper_runtime_values(self) -> tuple[str, str, str]:
+        model = canonical_french_whisper_model_name(
+            self.model_var.get() if hasattr(self, "model_var") else self.config.get("whisper", {}).get("default_model") or "medium"
+        )
+        if model not in WHISPER_MODEL_CHOICES:
+            model = "medium"
+        device = str(self.device_var.get() if hasattr(self, "device_var") else self.config.get("whisper", {}).get("device") or "cpu")
+        if device not in WHISPER_DEVICE_CHOICES:
+            device = "cpu"
+        compute_type = str(
+            self.compute_var.get() if hasattr(self, "compute_var") else self.config.get("whisper", {}).get("compute_type") or "int8"
+        )
+        if compute_type not in WHISPER_COMPUTE_CHOICES:
+            compute_type = "int8"
+        if hasattr(self, "model_var"):
+            self.model_var.set(model)
+        if hasattr(self, "device_var"):
+            self.device_var.set(device)
+        if hasattr(self, "compute_var"):
+            self.compute_var.set(compute_type)
+        return model, device, compute_type
+
+    def capture_whisper_runtime_settings(self) -> None:
+        model, device, compute_type = self.normalize_whisper_runtime_values()
+        input_device = self.selected_input_device() if hasattr(self, "micro_device_var") else str(
+            self.config.get("whisper", {}).get("input_device") or ""
+        )
+        initial_prompt = self.get_active_whisper_initial_prompt_text() or DEFAULT_WHISPER_INITIAL_PROMPT
+        faster = self.config.setdefault("faster_whisper", {})
+        faster.update(
+            {
+                "enabled": True,
+                "model": model,
+                "device": device,
+                "compute_type": compute_type,
+                "input_device": input_device,
+                "language": "fr",
+                "task": "transcribe",
+                "force_language": True,
+                "disable_language_detection": True,
+                "condition_on_previous_text": False,
+                "initial_prompt": initial_prompt,
+            }
+        )
+        whisper = self.config.setdefault("whisper", {})
+        whisper.update(
+            {
+                "default_model": model,
+                "device": device,
+                "compute_type": compute_type,
+                "input_device": input_device,
+                "language": "fr",
+                "task": "transcribe",
+                "force_language": True,
+                "disable_language_detection": True,
+                "condition_on_previous_text": False,
+                "initial_prompt": initial_prompt,
+            }
+        )
+
+    def save_whisper_runtime_settings(self) -> None:
+        self.capture_whisper_runtime_settings()
+        if self.selected_stt_engine_id() == FASTER_WHISPER_ENGINE_ID:
+            self.refresh_stt_engine_controls()
+        if self.write_runtime_config("whisper_runtime_settings") and hasattr(self, "model_status_var"):
+            self.model_status_var.set("Moteur STT: réglages enregistrés")
+
+    def get_stt_benchmark_engine_settings(self) -> dict[str, bool]:
+        return {
+            FASTER_WHISPER_ENGINE_ID: bool(self.stt_compare_faster_var.get()) if hasattr(self, "stt_compare_faster_var") else True,
+            QWEN3_ASR_ENGINE_ID: bool(self.stt_compare_qwen_var.get()) if hasattr(self, "stt_compare_qwen_var") else False,
+            VOXTRAL_ENGINE_ID: bool(self.stt_compare_voxtral_var.get()) if hasattr(self, "stt_compare_voxtral_var") else False,
+        }
+
+    def capture_stt_runtime_settings(self) -> None:
+        if not hasattr(self, "stt_engine_var"):
+            self.capture_whisper_runtime_settings()
+            return
+
+        engine_id = self.selected_stt_engine_id()
+        stt_config = self.config.setdefault("stt", {})
+        stt_config["default_engine"] = engine_id
+        stt_config["allow_experimental_engines"] = bool(self.stt_allow_experimental_var.get())
+        stt_config["keep_audio_for_benchmark"] = bool(self.stt_keep_audio_var.get())
+        stt_config["auto_fallback_to_faster_whisper"] = bool(self.stt_auto_fallback_var.get())
+        stt_config["show_engine_warnings"] = bool(self.stt_show_warnings_var.get())
+        stt_config["benchmark_engines"] = self.get_stt_benchmark_engine_settings()
+        if hasattr(self, "stt_context_bias_text"):
+            stt_config["stt_context_bias"] = self.get_text(self.stt_context_bias_text).strip()
+        if hasattr(self, "stt_speaker_map_text"):
+            stt_config["speaker_map"] = self.parse_stt_speaker_map(self.get_text(self.stt_speaker_map_text))
+
+        if engine_id == FASTER_WHISPER_ENGINE_ID:
+            selected_model = canonical_french_whisper_model_name(
+                self.stt_model_var.get() or self.model_var.get() or "medium"
+            )
+            if selected_model not in WHISPER_MODEL_CHOICES:
+                selected_model = "medium"
+            selected_device = self.stt_device_var.get() or self.device_var.get() or "cpu"
+            if selected_device not in WHISPER_DEVICE_CHOICES:
+                selected_device = "cpu"
+            compute_type = self.compute_var.get() or "int8"
+            if compute_type not in WHISPER_COMPUTE_CHOICES:
+                compute_type = "int8"
+            self.stt_model_var.set(selected_model)
+            self.model_var.set(selected_model)
+            self.device_var.set(selected_device)
+            self.compute_var.set(compute_type)
+            self.capture_whisper_runtime_settings()
+        else:
+            self.capture_whisper_runtime_settings()
+            target = self.config.setdefault(engine_id, {})
+            target["enabled"] = True
+            target["model"] = self.stt_model_var.get()
+            target["runtime"] = self.stt_runtime_var.get()
+            target["device"] = self.stt_device_var.get()
+            target.setdefault("language", "fr")
+            target.setdefault("mode", "batch")
+            target["external_cli_command"] = self.stt_external_cli_var.get().strip()
+            if engine_id == VOXTRAL_ENGINE_ID:
+                target["server_url"] = self.stt_server_url_var.get().strip() or "http://127.0.0.1:8000"
 
     def refresh_stt_engine_controls(self) -> None:
         if not hasattr(self, "stt_model_combo"):
@@ -3655,59 +5412,7 @@ class AssistantApp:
         if not hasattr(self, "stt_engine_var"):
             return
         engine_id = self.selected_stt_engine_id()
-        stt_config = self.config.setdefault("stt", {})
-        stt_config["default_engine"] = engine_id
-        stt_config["allow_experimental_engines"] = bool(self.stt_allow_experimental_var.get())
-        stt_config["keep_audio_for_benchmark"] = bool(self.stt_keep_audio_var.get())
-        stt_config["auto_fallback_to_faster_whisper"] = bool(self.stt_auto_fallback_var.get())
-        stt_config["show_engine_warnings"] = bool(self.stt_show_warnings_var.get())
-        if hasattr(self, "stt_context_bias_text"):
-            stt_config["stt_context_bias"] = self.get_text(self.stt_context_bias_text).strip()
-        if hasattr(self, "stt_speaker_map_text"):
-            stt_config["speaker_map"] = self.parse_stt_speaker_map(self.get_text(self.stt_speaker_map_text))
-
-        faster = self.config.setdefault("faster_whisper", {})
-        whisper = self.config.setdefault("whisper", {})
-        if engine_id == FASTER_WHISPER_ENGINE_ID:
-            selected_model = canonical_french_whisper_model_name(
-                self.stt_model_var.get() or self.model_var.get() or "medium"
-            )
-            selected_device = self.stt_device_var.get() or self.device_var.get() or "cpu"
-            self.stt_model_var.set(selected_model)
-            self.model_var.set(selected_model)
-            self.device_var.set(selected_device)
-            faster.update(
-                {
-                    "enabled": True,
-                    "model": selected_model,
-                    "device": selected_device,
-                    "compute_type": self.compute_var.get() or "int8",
-                    "language": "fr",
-                    "task": "transcribe",
-                    "force_language": True,
-                    "disable_language_detection": True,
-                    "condition_on_previous_text": False,
-                    "initial_prompt": self.get_active_whisper_initial_prompt_text() or DEFAULT_WHISPER_INITIAL_PROMPT,
-                }
-            )
-            whisper["default_model"] = faster["model"]
-            whisper["device"] = faster["device"]
-            whisper["compute_type"] = faster["compute_type"]
-            whisper["language"] = "fr"
-            whisper["task"] = "transcribe"
-            whisper["condition_on_previous_text"] = False
-        else:
-            target = self.config.setdefault(engine_id, {})
-            target["enabled"] = True
-            target["model"] = self.stt_model_var.get()
-            target["runtime"] = self.stt_runtime_var.get()
-            target["device"] = self.stt_device_var.get()
-            target.setdefault("language", "fr")
-            target.setdefault("mode", "batch")
-            target["external_cli_command"] = self.stt_external_cli_var.get().strip()
-            if engine_id == VOXTRAL_ENGINE_ID:
-                target["server_url"] = self.stt_server_url_var.get().strip() or "http://127.0.0.1:8000"
-
+        self.capture_stt_runtime_settings()
         try:
             save_json(BASE_DIR / "config.json", self.config)
             self.refresh_stt_engine_controls()
@@ -3735,6 +5440,7 @@ class AssistantApp:
                 "keep_audio_for_benchmark": bool(self.stt_keep_audio_var.get()),
                 "auto_fallback_to_faster_whisper": bool(self.stt_auto_fallback_var.get()),
                 "show_engine_warnings": bool(self.stt_show_warnings_var.get()),
+                "benchmark_engines": self.get_stt_benchmark_engine_settings(),
                 "stt_context_bias": self.get_text(self.stt_context_bias_text).strip()
                 if hasattr(self, "stt_context_bias_text")
                 else self.config.get("stt", {}).get("stt_context_bias", ""),
@@ -3762,6 +5468,54 @@ class AssistantApp:
                 "initial_prompt": self.get_active_whisper_initial_prompt_text() or DEFAULT_WHISPER_INITIAL_PROMPT,
             }
         )
+        medical_config = dict(self.config.get("medical_transcription", {}))
+        weda_context = self.get_text(self.context_text) if hasattr(self, "context_text") else ""
+        include_weda_prompt = bool(
+            self.whisper_include_weda_context_var.get()
+            if hasattr(self, "whisper_include_weda_context_var")
+            else medical_config.get("include_weda_context_in_whisper_prompt", True)
+        )
+        use_dynamic_hotwords = bool(
+            self.whisper_use_dynamic_hotwords_var.get()
+            if hasattr(self, "whisper_use_dynamic_hotwords_var")
+            else medical_config.get("use_dynamic_weda_hotwords", True)
+        )
+        final_prompt, dynamic_context = build_dynamic_whisper_prompt(
+            faster["initial_prompt"],
+            weda_context,
+            include_weda_context=include_weda_prompt,
+            max_dynamic_characters=int(
+                medical_config.get("max_dynamic_prompt_characters", MAX_DYNAMIC_PROMPT_CHARACTERS)
+            ),
+        )
+        permanent_hotwords = (
+            self.get_text(self.permanent_hotwords_text)
+            if hasattr(self, "permanent_hotwords_text")
+            else medical_config.get("permanent_hotwords", DEFAULT_PERMANENT_MEDICAL_HOTWORDS)
+        )
+        correction_hotwords = self.correction_store.hotwords() if hasattr(self, "correction_store") else []
+        hotword_bundle = build_hotword_bundle(
+            permanent_hotwords,
+            weda_context,
+            correction_hotwords,
+            include_weda=use_dynamic_hotwords,
+            max_hotwords=int(medical_config.get("max_hotwords", MAX_HOTWORDS)),
+            max_hotword_length=int(medical_config.get("max_hotword_length", MAX_HOTWORD_LENGTH)),
+            max_characters=int(medical_config.get("max_hotwords_characters", MAX_HOTWORDS_CHARACTERS)),
+        )
+        faster["initial_prompt"] = final_prompt
+        faster["hotwords"] = hotword_bundle.faster_whisper_value
+        faster["hotwords_count"] = len(hotword_bundle.final)
+        config["medical_whisper_diagnostics"] = {
+            "base_prompt": self.get_active_whisper_initial_prompt_text() or DEFAULT_WHISPER_INITIAL_PROMPT,
+            "dynamic_context": dynamic_context,
+            "final_prompt": final_prompt,
+            "permanent_hotwords_count": len(hotword_bundle.permanent),
+            "weda_hotwords_count": len(hotword_bundle.weda),
+            "correction_hotwords_count": len(hotword_bundle.corrections),
+            "final_hotwords": list(hotword_bundle.final),
+        }
+        self.last_whisper_diagnostics = dict(config["medical_whisper_diagnostics"])
         legacy = config["whisper"]
         legacy.update(
             {
@@ -3797,8 +5551,12 @@ class AssistantApp:
             auto_delete_audio = False
         return {
             **config,
-            "segment_seconds": faster.get("segment_seconds", legacy.get("segment_seconds", 15)),
-            "overlap_seconds": faster.get("overlap_seconds", legacy.get("overlap_seconds", 1)),
+            "segment_seconds": faster.get(
+                "segment_seconds", legacy.get("segment_seconds", TRANSCRIPTION_WINDOW_SECONDS)
+            ),
+            "overlap_seconds": faster.get(
+                "overlap_seconds", legacy.get("overlap_seconds", TRANSCRIPTION_OVERLAP_SECONDS)
+            ),
             "sample_rate": legacy.get("sample_rate", 16000),
             "input_device": self.selected_input_device(),
             "auto_delete_audio": auto_delete_audio,
@@ -3952,6 +5710,8 @@ class AssistantApp:
             messagebox.showwarning("Benchmark STT", "Ce résultat ne contient pas de transcription utilisable.", parent=self.root)
             return
         self.set_text(self.transcription_text, text)
+        if hasattr(self, "corrected_transcription_text"):
+            self.set_text(self.corrected_transcription_text, text)
         self.last_stt_result = result
         self.transcription_status_var.set("Transcription remplacée par le benchmark STT")
         self.model_status_var.set(f"Moteur STT: {STT_ENGINE_LABELS.get(result.get('engine'), result.get('engine'))}")
@@ -4086,10 +5846,16 @@ class AssistantApp:
                 "min_silence_duration_ms": int_setting("min_silence_duration_ms", 250, 100, 2000),
                 "vad_filter": bool_setting("vad_filter", False),
                 "without_timestamps": bool_setting("without_timestamps", True),
+                "max_new_tokens": int_setting("max_new_tokens", 128, 16, 256),
                 "initial_prompt": str(
                     fly_config.get("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
                     or ""
                 ),
+                # La volée reste une dictée courte autonome : le contexte WEDA
+                # et les hotwords de la consultation principale ne doivent pas
+                # consommer la fenêtre de décodage du modèle Turbo.
+                "hotwords": "",
+                "hotwords_count": 0,
             }
         )
         if getattr(self, "_fly_cuda_runtime_failed", False) and str(settings.get("device") or "").lower() == "cuda":
@@ -4109,7 +5875,7 @@ class AssistantApp:
 
     def save_micro_device(self) -> None:
         value = self.selected_input_device()
-        self.config.setdefault("whisper", {})["input_device"] = value
+        self.capture_whisper_runtime_settings()
         try:
             save_json(BASE_DIR / "config.json", self.config)
             self.log_debug(
@@ -4276,6 +6042,7 @@ class AssistantApp:
         fly_config.setdefault("condition_on_previous_text", False)
         fly_config.setdefault("vad_filter", False)
         fly_config.setdefault("without_timestamps", True)
+        fly_config.setdefault("max_new_tokens", 128)
         fly_config.setdefault("min_silence_duration_ms", 250)
         fly_config.setdefault("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
         fly_config.setdefault("preload_model", True)
@@ -4810,6 +6577,7 @@ class AssistantApp:
             self.fly_dictation_status_var.set("Volée: texte vide")
             return
 
+        clipboard_snapshot_available, previous_clipboard_text = read_text_from_clipboard(self.root)
         copied = copy_text_to_clipboard(value, self.root)
         if not copied:
             self.fly_dictation_status_var.set("Volée: copie impossible")
@@ -4818,25 +6586,116 @@ class AssistantApp:
 
         delay_ms = int(self.get_fly_dictation_settings().get("paste_delay_ms", 0))
         self.fly_dictation_status_var.set("Volée: collage en cours")
-        self.root.after(delay_ms, lambda: self.send_fly_dictation_paste(value))
+        self.root.after(
+            delay_ms,
+            lambda: self.send_fly_dictation_paste(
+                value,
+                clipboard_snapshot_available=clipboard_snapshot_available,
+                previous_clipboard_text=previous_clipboard_text,
+            ),
+        )
 
-    def send_fly_dictation_paste(self, text: str) -> None:
+    def send_fly_dictation_paste(
+        self,
+        text: str,
+        *,
+        clipboard_snapshot_available: bool = False,
+        previous_clipboard_text: str = "",
+    ) -> None:
+        current_readable, current_clipboard_text = read_text_from_clipboard(self.root)
+        if current_readable and current_clipboard_text != text:
+            self.fly_dictation_status_var.set("Volée: collage annulé (presse-papier modifié)")
+            self.log_debug(
+                "warning",
+                "app",
+                "fly_dictation_paste_cancelled_clipboard_changed",
+                "Collage à la volée annulé car le presse-papier a changé avant Ctrl+V.",
+                {
+                    "text_length": len(text or ""),
+                    "clipboard_length": len(current_clipboard_text or ""),
+                    "had_snapshot": clipboard_snapshot_available,
+                },
+            )
+            return
+
         try:
             keyboard_module = self._fly_keyboard
             if keyboard_module is None:
                 import keyboard as keyboard_module
             keyboard_module.send("ctrl+v")
             self.fly_dictation_status_var.set(f"Volée: texte collé ({len(text.split())} mot(s))")
+            self.root.after(
+                FLY_DICTATION_CLIPBOARD_RESTORE_DELAY_MS,
+                lambda: self.restore_fly_dictation_clipboard(
+                    text,
+                    clipboard_snapshot_available=clipboard_snapshot_available,
+                    previous_clipboard_text=previous_clipboard_text,
+                ),
+            )
             self.log_debug(
                 "info",
                 "app",
                 "fly_dictation_pasted",
                 "Dictée à la volée copiée puis collée dans la cible active.",
-                {"text_length": len(text or "")},
+                {"text_length": len(text or ""), "had_clipboard_snapshot": clipboard_snapshot_available},
             )
         except Exception as exc:
-            self.fly_dictation_status_var.set("Volée: texte copié, collage impossible")
+            self.restore_fly_dictation_clipboard(
+                text,
+                clipboard_snapshot_available=clipboard_snapshot_available,
+                previous_clipboard_text=previous_clipboard_text,
+            )
+            self.fly_dictation_status_var.set("Volée: collage impossible")
             self.log_debug("error", "app", "fly_dictation_paste_error", str(exc))
+
+    def restore_fly_dictation_clipboard(
+        self,
+        pasted_text: str,
+        *,
+        clipboard_snapshot_available: bool = False,
+        previous_clipboard_text: str = "",
+    ) -> None:
+        current_readable, current_clipboard_text = read_text_from_clipboard(self.root)
+        if not current_readable:
+            self.log_debug(
+                "warning",
+                "app",
+                "fly_dictation_clipboard_restore_unreadable",
+                "Restauration du presse-papier ignorée car son contenu texte est illisible.",
+                {"had_snapshot": clipboard_snapshot_available},
+            )
+            return
+
+        if current_clipboard_text != pasted_text:
+            self.log_debug(
+                "info",
+                "app",
+                "fly_dictation_clipboard_restore_skipped_changed",
+                "Restauration du presse-papier ignorée car l'utilisateur l'a modifié après le collage.",
+                {
+                    "text_length": len(pasted_text or ""),
+                    "clipboard_length": len(current_clipboard_text or ""),
+                    "had_snapshot": clipboard_snapshot_available,
+                },
+            )
+            return
+
+        if clipboard_snapshot_available and previous_clipboard_text:
+            restored = copy_text_to_clipboard(previous_clipboard_text, self.root)
+        else:
+            restored = clear_text_clipboard(self.root)
+
+        self.log_debug(
+            "info" if restored else "warning",
+            "app",
+            "fly_dictation_clipboard_restored" if clipboard_snapshot_available else "fly_dictation_clipboard_cleared",
+            "Presse-papier restauré après collage à la volée.",
+            {
+                "restored": restored,
+                "had_snapshot": clipboard_snapshot_available,
+                "previous_text_length": len(previous_clipboard_text or ""),
+            },
+        )
 
     def on_fly_dictation_error(self, error: Exception) -> None:
         self._fly_busy = False
@@ -4847,6 +6706,7 @@ class AssistantApp:
     def save_connector_settings(self) -> None:
         start_key = self.connector_start_key_var.get() or "PageUp"
         stop_key = self.connector_stop_key_var.get() or "PageDown"
+        document_now_key = self.connector_document_now_key_var.get() or "F8"
         if start_key == stop_key:
             messagebox.showwarning(
                 "Connecteur WEDA",
@@ -4855,11 +6715,23 @@ class AssistantApp:
             )
             stop_key = "PageDown" if start_key != "PageDown" else "PageUp"
             self.connector_stop_key_var.set(stop_key)
+        if document_now_key in {start_key, stop_key}:
+            messagebox.showwarning(
+                "Connecteur WEDA",
+                "La touche « Document maintenant » doit être différente des touches de démarrage et d’arrêt.",
+                parent=self.root,
+            )
+            document_now_key = next(
+                (key for key in self.connector_key_choices() if key not in {start_key, stop_key}),
+                "F8",
+            )
+            self.connector_document_now_key_var.set(document_now_key)
 
         connector_config = self.config.setdefault("connector", {})
         connector_config["enabled"] = bool(self.connector_enabled_var.get())
         connector_config["start_key"] = start_key
         connector_config["stop_key"] = stop_key
+        connector_config["document_now_key"] = document_now_key
         connector_config.setdefault("stop_transcription_grace_seconds", 2)
         connector_config.setdefault("auto_return_home", True)
         try:
@@ -4884,6 +6756,7 @@ class AssistantApp:
             "enabled": bool(connector_config.get("enabled", False)),
             "start_key": str(connector_config.get("start_key") or "PageUp"),
             "stop_key": str(connector_config.get("stop_key") or "PageDown"),
+            "document_now_key": str(connector_config.get("document_now_key") or "F8"),
             "stop_transcription_grace_seconds": max(0.0, min(10.0, grace_seconds)),
             "auto_return_home": bool(connector_config.get("auto_return_home", True)),
         }
@@ -4947,6 +6820,7 @@ class AssistantApp:
 
         label = self.get_recording_indicator_label(self._recording_indicator_source)
         self.root.title(f"[{label}] {self.base_window_title}" if active else self.base_window_title)
+        self.update_tray_icon()
 
         if not hasattr(self, "recording_badge"):
             return
@@ -4998,12 +6872,30 @@ class AssistantApp:
         )
         self.session.start()
 
-    def stop_dictation(self) -> None:
-        if self.session and self.session.is_running():
-            self.session.stop()
+    def stop_dictation(self):
+        session = self.session if self.session and not self.session.is_finished() else None
+        if session and session.is_running():
+            session.stop()
         self.set_dictation_buttons_running(False)
         self.set_recording_indicator(False)
         self.micro_status_var.set("Micro: arrêt demandé")
+        return session
+
+    def pending_dictation_session(self):
+        if self.session and not self.session.is_finished():
+            return self.session
+        return None
+
+    def wait_for_dictation_transcription(self, session, *, timeout_seconds: float | None = None) -> None:
+        if not session or session.is_finished():
+            return
+        wait_timeout = (
+            DICTATION_TRANSCRIPTION_FLUSH_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if not session.wait_until_finished(wait_timeout):
+            raise TimeoutError("La transcription finale n’est pas terminée.")
 
     def set_dictation_buttons_running(self, running: bool) -> None:
         state_start = tk.DISABLED if running else tk.NORMAL
@@ -5011,6 +6903,11 @@ class AssistantApp:
         self.continue_dictation_button.configure(state=state_start)
         self.new_dictation_button.configure(state=state_start)
         self.stop_dictation_button.configure(state=state_stop)
+
+    def set_dictation_buttons_waiting(self) -> None:
+        self.continue_dictation_button.configure(state=tk.DISABLED)
+        self.new_dictation_button.configure(state=tk.DISABLED)
+        self.stop_dictation_button.configure(state=tk.DISABLED)
 
     def reset_session_fields(self) -> None:
         self.dictation_run_id += 1
@@ -5020,8 +6917,14 @@ class AssistantApp:
 
         self.context_manager.clear()
         self.import_manager.clear()
+        self.rich_result_payloads.clear()
         self.set_text(self.context_text, "")
         self.set_text(self.transcription_text, "")
+        if hasattr(self, "corrected_transcription_text"):
+            self.set_text(self.corrected_transcription_text, "")
+        if hasattr(self, "correction_review_text"):
+            self.set_text(self.correction_review_text, "", readonly=True)
+        self.transcription_draft_store.clear()
         self.set_text(self.result_text, "")
         self.set_text(self.sent_message_text, "", readonly=True)
         self.set_text(self.secondary_result_text, "")
@@ -5063,6 +6966,95 @@ class AssistantApp:
             if job_id and self.connector_job.get("id") != job_id:
                 return None
             return dict(self.connector_job)
+
+    def set_document_now_connector_job(
+        self,
+        updates: dict,
+        *,
+        job_id: str = "",
+        replace: bool = False,
+    ) -> dict:
+        with self._document_now_connector_lock:
+            current = (
+                {}
+                if replace or self.document_now_connector_job is None
+                else dict(self.document_now_connector_job)
+            )
+            if job_id and current.get("id") != job_id:
+                return current
+            current.update(updates)
+            current["updated_at"] = time.time()
+            self.document_now_connector_job = current
+            return dict(current)
+
+    def get_document_now_connector_job(self, job_id: str = "") -> dict | None:
+        with self._document_now_connector_lock:
+            if not self.document_now_connector_job:
+                return None
+            if job_id and self.document_now_connector_job.get("id") != job_id:
+                return None
+            return dict(self.document_now_connector_job)
+
+    def connector_document_now(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        active_job = self.get_document_now_connector_job()
+        if active_job and active_job.get("status") in {"waiting_transcription", "generating"}:
+            return active_job
+
+        job_id = uuid.uuid4().hex
+        job = self.set_document_now_connector_job(
+            {
+                "id": job_id,
+                "status": "starting",
+                "message": "Préparation de « Document maintenant ».",
+                "patient_id": str(payload.get("patient_id") or ""),
+                "patient_identity": str(payload.get("patient_identity") or ""),
+                "page_url": str(payload.get("page_url") or ""),
+                "created_at": time.time(),
+                "clipboard_copied": False,
+            },
+            replace=True,
+        )
+        if not self.get_connector_settings().get("enabled"):
+            return self.set_document_now_connector_job(
+                {
+                    "status": "disabled",
+                    "message": "Connecteur WEDA désactivé dans l’application.",
+                },
+                job_id=job_id,
+            )
+
+        try:
+            self.call_ui_sync(
+                lambda: self.request_connector_document_now_checkpoint(
+                    job_id,
+                    expected_patient_id=str(payload.get("patient_id") or ""),
+                ),
+                timeout_seconds=15,
+            )
+            job = self.get_document_now_connector_job(job_id) or job
+            self.log_debug(
+                "info",
+                "connector",
+                "connector_document_now_started",
+                "Document maintenant lancé depuis WEDA.",
+                {
+                    "job_id": job_id,
+                    "snapshot_id": job.get("snapshot_id", ""),
+                    "status": job.get("status", ""),
+                },
+            )
+        except Exception as exc:
+            job = self.set_document_now_connector_job(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                    "error": str(exc),
+                },
+                job_id=job_id,
+            )
+            self.log_debug("error", "connector", "connector_document_now_start_error", str(exc), job)
+        return job
 
     def connector_start(self, payload: dict | None = None) -> dict:
         payload = payload or {}
@@ -5121,7 +7113,7 @@ class AssistantApp:
         )
 
         try:
-            self.call_ui_sync(self.stop_dictation)
+            stopped_session = self.call_ui_sync(self.stop_dictation)
         except Exception as exc:
             job = self.set_connector_job({"status": "error", "message": str(exc), "error": str(exc)})
             self.log_debug("error", "connector", "connector_stop_error", str(exc), job)
@@ -5129,22 +7121,68 @@ class AssistantApp:
 
         threading.Thread(
             target=self.run_connector_stop_worker,
-            args=(job_id, payload),
+            args=(job_id, payload, stopped_session),
             name="weda-connector-stop",
             daemon=True,
         ).start()
         return job
 
-    def run_connector_stop_worker(self, job_id: str, payload: dict) -> None:
+    def finalize_connector_primary_result(
+        self,
+        *,
+        response,
+        message: str,
+        result_payload: RichTextPayload,
+        patient_id: str,
+        patient_identity: str,
+    ) -> None:
+        self.record_generation_metric(
+            "connector",
+            "result_1",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(message or ""),
+            result_chars=len(result_payload.text or ""),
+        )
+        self.set_rich_result_text(self.result_text, result_payload, source="result_1")
+        self.lmstudio_status_var.set(f"LM Studio: réponse connecteur reçue en {response.elapsed_seconds:.1f}s")
+        self.import_status_var.set("Import WEDA: résultat connecteur prêt")
+        self.history_manager.append(
+            {
+                **self.current_stt_history_payload(),
+                "whisper_model": self.model_manager.active_label(),
+                "prompt_name": self.prompt_var.get(),
+                "transcription": self.get_clean_transcription_text(),
+                "weda_context": self.get_text(self.context_text),
+                "sent_message": message,
+                "lmstudio_result": result_payload.text,
+                "status": "connector_result_ready",
+                "patient_id": patient_id,
+                "patient_identity": patient_identity,
+            }
+        )
+        if self.is_secondary_auto_run_enabled():
+            self.log_debug(
+                "info",
+                "connector",
+                "connector_followup_chain_started",
+                "Enchaînement automatique Prompt 2 puis Prompt 3 démarré après le Résultat 1 du connecteur.",
+            )
+            self.run_secondary_analysis(
+                trigger="auto",
+                primary_sent_message=message,
+                primary_result=result_payload.text,
+            )
+
+    def run_connector_stop_worker(self, job_id: str, payload: dict, stopped_session=None) -> None:
         try:
             settings = self.get_connector_settings()
-            grace_seconds = float(settings.get("stop_transcription_grace_seconds", 2))
-            if grace_seconds > 0:
+            if stopped_session and not stopped_session.is_finished():
                 self.set_connector_job({
                     "status": "waiting_transcription_flush",
-                    "message": f"Attente du dernier segment Whisper ({grace_seconds:.1f}s).",
+                    "message": "Attente de la fin complète de la transcription.",
                 })
-                time.sleep(grace_seconds)
+                self.wait_for_dictation_transcription(stopped_session)
 
             self.set_connector_job({"status": "generating", "message": "Envoi à LM Studio."})
             self.call_ui_sync(self.refresh_context_from_manager, timeout_seconds=10)
@@ -5152,37 +7190,38 @@ class AssistantApp:
             if not message:
                 raise RuntimeError("Message LM Studio vide après arrêt de la dictée.")
 
-            response = self.build_lmstudio_client().chat(message)
+            client = self.build_lmstudio_client()
+            self.adjust_lmstudio_client_for_context(client, message, label="connecteur")
+            self.call_ui_sync(lambda: self.capture_pending_result_patient_binding("result_1"), timeout_seconds=10)
+            response = self.chat_lmstudio_managed_blocking("connector", client, message)
             context = self.context_manager.get_latest()
             patient_id = context.patient_id if context else str(payload.get("patient_id") or "")
             patient_identity = context.patient_identity if context else str(payload.get("patient_identity") or "")
+            result_payload = self.call_ui_sync(
+                lambda: self.remember_weda_result_payload(
+                    "result_1",
+                    self.apply_abbreviations_to_lmstudio_result(response.text, "Résultat connecteur"),
+                ),
+                timeout_seconds=10,
+            )
             request = self.import_manager.prepare_result(
-                response.text,
+                result_payload.text,
+                result_html=result_payload.html,
                 patient_id=patient_id,
                 patient_identity=patient_identity,
                 destination="connector_auto",
             )
 
-            def ui_done():
-                self.set_text(self.result_text, response.text)
-                self.lmstudio_status_var.set(f"LM Studio: réponse connecteur reçue en {response.elapsed_seconds:.1f}s")
-                self.import_status_var.set("Import WEDA: résultat connecteur prêt")
-                self.history_manager.append(
-                    {
-                        **self.current_stt_history_payload(),
-                        "whisper_model": self.model_manager.active_label(),
-                        "prompt_name": self.prompt_var.get(),
-                        "transcription": self.get_clean_transcription_text(),
-                        "weda_context": self.get_text(self.context_text),
-                        "sent_message": message,
-                        "lmstudio_result": response.text,
-                        "status": "connector_result_ready",
-                        "patient_id": patient_id,
-                        "patient_identity": patient_identity,
-                    }
-                )
-
-            self.call_ui_sync(ui_done, timeout_seconds=10)
+            self.call_ui_sync(
+                lambda: self.finalize_connector_primary_result(
+                    response=response,
+                    message=message,
+                    result_payload=result_payload,
+                    patient_id=patient_id,
+                    patient_identity=patient_identity,
+                ),
+                timeout_seconds=10,
+            )
             job = self.set_connector_job(
                 {
                     "status": "result_ready",
@@ -5190,15 +7229,36 @@ class AssistantApp:
                     "request_id": request.id,
                     "patient_id": patient_id,
                     "patient_identity": patient_identity,
-                    "result_length": len(response.text or ""),
+                    "result_length": len(result_payload.text or ""),
+                    "result_html_length": len(result_payload.html or ""),
                     "elapsed_seconds": response.elapsed_seconds,
                     "auto_return_home": bool(settings.get("auto_return_home", True)),
                 }
             )
             self.log_debug("info", "connector", "connector_result_ready", "Résultat connecteur prêt.", job)
         except Exception as exc:
-            job = self.set_connector_job({"status": "error", "message": str(exc), "error": str(exc)})
-            self.log_debug("error", "connector", "connector_generation_error", str(exc), job)
+            try:
+                self.call_ui_sync(lambda: self.discard_pending_result_patient_binding("result_1"), timeout_seconds=5)
+                status = "cancelled" if isinstance(exc, LmStudioCancelled) else "error"
+                self.call_ui_sync(
+                    lambda metric_status=status, error=exc: self.record_generation_metric(
+                        "connector",
+                        "result_1",
+                        status=metric_status,
+                        error=error,
+                    ),
+                    timeout_seconds=5,
+                )
+            except Exception:
+                status = "error"
+            job = self.set_connector_job({"status": status, "message": str(exc), "error": str(exc)})
+            self.log_debug(
+                "info" if status == "cancelled" else "error",
+                "connector",
+                "connector_generation_cancelled" if status == "cancelled" else "connector_generation_error",
+                str(exc),
+                job,
+            )
 
     def on_segment_started(self, index: int, run_id: int) -> None:
         if run_id != self.dictation_run_id:
@@ -5221,8 +7281,16 @@ class AssistantApp:
             if mapped_text:
                 result.text = mapped_text
         result.text = clean_transcription_text(str(result.text or ""), self.config.get("transcription_cleaning", {}))
+        previous_raw = self.get_text(self.transcription_text)
+        overlap_deduplication = deduplicate_transcription_overlap(previous_raw, result.text)
+        result.text = overlap_deduplication.text_to_append
+        result.deduplicated_words = overlap_deduplication.removed_words
+        result.deduplicated_characters = overlap_deduplication.removed_characters
+        if not result.text and overlap_deduplication.removed_words:
+            result.empty_reason = "overlap_duplicate_removed"
         if result.text:
             self.append_transcription_line(result.text)
+            self.update_corrected_transcription_from_raw(previous_raw, result.text)
         self.model_status_var.set(f"Moteur STT: {result.model_label}")
         self.stt_status_var.set(
             f"STT: {getattr(result, 'stt_engine', '') or 'moteur'} {getattr(result, 'stt_model', '')}".strip()
@@ -5258,6 +7326,11 @@ class AssistantApp:
                 "stt_errors": getattr(result, "stt_errors", []),
                 "audio_stats": getattr(result, "audio_stats", {}),
                 "checkpoint_ids": getattr(result, "checkpoint_ids", []),
+                "window": getattr(result, "window_metadata", {}),
+                "deduplicated_words": getattr(result, "deduplicated_words", 0),
+                "deduplicated_characters": getattr(result, "deduplicated_characters", 0),
+                "prompt_length": (getattr(result, "stt_result", {}) or {}).get("raw", {}).get("prompt_length", 0),
+                "hotwords_count": (getattr(result, "stt_result", {}) or {}).get("raw", {}).get("hotwords_count", 0),
             },
         )
         self.handle_document_now_checkpoints(result)
@@ -5276,6 +7349,44 @@ class AssistantApp:
                 self.transcription_text.tag_add("diagnostic", start, "end-1c")
             except Exception:
                 pass
+
+    def update_corrected_transcription_from_raw(self, previous_raw: str, appended_raw: str) -> None:
+        if not hasattr(self, "corrected_transcription_text"):
+            return
+        current_corrected = self.get_text(self.corrected_transcription_text)
+        full_raw = self.get_text(self.transcription_text)
+        if not current_corrected or current_corrected.strip() == str(previous_raw or "").strip():
+            candidate = full_raw
+        else:
+            deduplicated = deduplicate_transcription_overlap(current_corrected, appended_raw)
+            separator = "\n" if current_corrected.strip() and deduplicated.text_to_append else ""
+            candidate = current_corrected + separator + deduplicated.text_to_append
+        medical_config = self.config.get("medical_transcription", {})
+        apply_automatic = bool(
+            self.whisper_apply_corrections_var.get()
+            if hasattr(self, "whisper_apply_corrections_var")
+            else medical_config.get("apply_validated_corrections", False)
+        )
+        applied = 0
+        if apply_automatic:
+            candidate, applied = self.correction_store.apply_conservative(
+                candidate,
+                min_validations=int(
+                    medical_config.get(
+                        "min_validations_for_automatic_correction",
+                        MIN_VALIDATIONS_FOR_AUTOMATIC_CORRECTION,
+                    )
+                ),
+            )
+        self.set_text(self.corrected_transcription_text, candidate)
+        if applied:
+            self.log_debug(
+                "info",
+                "transcription",
+                "validated_corrections_applied",
+                "Corrections locales très fiables appliquées à la couche corrigée.",
+                {"count": applied},
+            )
 
     def update_micro_level_status(self, result, *, ignored: bool) -> None:
         audio_stats = getattr(result, "audio_stats", {}) or {}
@@ -5296,6 +7407,7 @@ class AssistantApp:
             "audio_silent_or_wrong_input_device": "silence ou mauvais micro",
             "no_text_after_retry_without_vad": "signal détecté mais aucun texte",
             "no_speech_segment_detected": "aucune parole détectée",
+            "overlap_duplicate_removed": "répétition de chevauchement retirée",
             "speech_segment_without_text": "segment sans texte",
         }
         return labels.get(reason, reason or "aucun texte")
@@ -5345,18 +7457,33 @@ class AssistantApp:
     def reset_prompt_references_after_delete(self, prompt_id: str) -> None:
         changed = False
         secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
+        secondary_changed = False
         if secondary_config.get("default_prompt_id") == prompt_id:
             secondary_config["default_prompt_id"] = SECONDARY_ANALYSIS_PROMPT_ID
+            secondary_changed = True
+        if secondary_config.get("last_prompt_id") == prompt_id:
+            secondary_config["last_prompt_id"] = secondary_config["default_prompt_id"]
+            secondary_changed = True
+        if secondary_changed:
             self.config["secondary_analysis"] = secondary_config
             changed = True
         tertiary_config = normalize_tertiary_analysis_config(self.config.get("tertiary_analysis", {}))
+        tertiary_changed = False
         if tertiary_config.get("default_prompt_id") == prompt_id:
             tertiary_config["default_prompt_id"] = TERTIARY_ANALYSIS_PROMPT_ID
+            tertiary_changed = True
+        if tertiary_config.get("last_prompt_id") == prompt_id:
+            tertiary_config["last_prompt_id"] = tertiary_config["default_prompt_id"]
+            tertiary_changed = True
+        if tertiary_changed:
             self.config["tertiary_analysis"] = tertiary_config
             changed = True
         document_now_config = self.config.setdefault("document_now", {})
         if document_now_config.get("default_prompt_id") == prompt_id:
             document_now_config["default_prompt_id"] = DOCUMENT_NOW_PROMPT_ID
+            changed = True
+        if document_now_config.get("last_prompt_id") == prompt_id:
+            document_now_config["last_prompt_id"] = document_now_config["default_prompt_id"]
             changed = True
         if changed:
             save_json(BASE_DIR / "config.json", self.config)
@@ -5366,7 +7493,9 @@ class AssistantApp:
         self.prompt_name_to_id = {prompt.name: prompt.id for prompt in prompts}
         self.prompt_combo["values"] = [prompt.name for prompt in prompts] if hasattr(self, "prompt_combo") else []
 
-        selected = self.prompt_manager.get(selected_id) if selected_id else self.prompt_manager.get_default("generic")
+        selected = self.prompt_manager.get(selected_id) if selected_id else None
+        if selected is None:
+            selected = self.prompt_manager.get(str(self.config.get("ui", {}).get("last_prompt_id") or ""))
         if selected is not None and selected.prompt_type != "generic":
             selected = None
         if selected is None:
@@ -5385,6 +7514,11 @@ class AssistantApp:
         self.set_text(self.prompt_text, prompt.content)
         marker = " par défaut" if prompt.is_default else ""
         self.prompt_status_var.set(f"Prompt: {prompt.name}{marker}")
+
+    def on_prompt_selected(self) -> None:
+        self.load_selected_prompt()
+        self.capture_prompt_selection_settings()
+        self.write_runtime_config("prompt_selection")
 
     def new_prompt(self) -> None:
         name = simpledialog.askstring("Nouveau prompt", "Nom du prompt :", parent=self.root)
@@ -5434,6 +7568,8 @@ class AssistantApp:
         if not prompt_id:
             return
         self.prompt_manager.set_default(prompt_id)
+        self.config.setdefault("ui", {})["last_prompt_id"] = prompt_id
+        self.write_runtime_config("default_prompt_selection")
         self.refresh_common_prompt_combos(target="primary", selected_id=prompt_id)
 
     def _refresh_secondary_prompt_combo(self, selected_id: str | None = None) -> None:
@@ -5442,9 +7578,12 @@ class AssistantApp:
         if hasattr(self, "secondary_prompt_combo"):
             self.secondary_prompt_combo["values"] = [prompt.name for prompt in prompts]
 
-        secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
+        secondary_raw_config = self.config.get("secondary_analysis", {})
+        secondary_config = normalize_secondary_analysis_config(secondary_raw_config)
         selected = self.prompt_manager.get(selected_id) if selected_id else None
         if selected is None:
+            selected = self.prompt_manager.get(str(secondary_raw_config.get("last_prompt_id") or ""))
+        if selected is None or selected.prompt_type != "generic":
             selected = self.prompt_manager.get(str(secondary_config.get("default_prompt_id") or ""))
         if selected is None or selected.prompt_type != "generic":
             selected = self.prompt_manager.get_default("generic")
@@ -5464,6 +7603,11 @@ class AssistantApp:
         self.update_secondary_status(prompt=prompt)
         self.schedule_secondary_message_refresh()
 
+    def on_secondary_prompt_selected(self) -> None:
+        self.load_selected_secondary_prompt()
+        self.capture_prompt_selection_settings()
+        self.write_runtime_config("secondary_prompt_selection")
+
     def update_secondary_status(self, prompt=None) -> None:
         if prompt is None:
             prompt = self.prompt_manager.get(self.current_secondary_prompt_id())
@@ -5480,6 +7624,7 @@ class AssistantApp:
         secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
         secondary_config["enabled"] = bool(self.secondary_enabled_var.get())
         if self.current_secondary_prompt_id():
+            secondary_config["last_prompt_id"] = self.current_secondary_prompt_id()
             secondary_config["default_prompt_id"] = secondary_config.get("default_prompt_id") or self.current_secondary_prompt_id()
         self.config["secondary_analysis"] = secondary_config
         try:
@@ -5542,6 +7687,7 @@ class AssistantApp:
             return
         secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
         secondary_config["default_prompt_id"] = prompt.id
+        secondary_config["last_prompt_id"] = prompt.id
         self.config["secondary_analysis"] = secondary_config
         try:
             save_json(BASE_DIR / "config.json", self.config)
@@ -5555,9 +7701,12 @@ class AssistantApp:
         if hasattr(self, "tertiary_prompt_combo"):
             self.tertiary_prompt_combo["values"] = [prompt.name for prompt in prompts]
 
-        tertiary_config = normalize_tertiary_analysis_config(self.config.get("tertiary_analysis", {}))
+        tertiary_raw_config = self.config.get("tertiary_analysis", {})
+        tertiary_config = normalize_tertiary_analysis_config(tertiary_raw_config)
         selected = self.prompt_manager.get(selected_id) if selected_id else None
         if selected is None:
+            selected = self.prompt_manager.get(str(tertiary_raw_config.get("last_prompt_id") or ""))
+        if selected is None or selected.prompt_type != "generic":
             selected = self.prompt_manager.get(str(tertiary_config.get("default_prompt_id") or ""))
         if selected is None or selected.prompt_type != "generic":
             selected = self.prompt_manager.get_default("generic")
@@ -5577,6 +7726,11 @@ class AssistantApp:
         self.update_tertiary_status(prompt=prompt)
         self.schedule_tertiary_message_refresh()
 
+    def on_tertiary_prompt_selected(self) -> None:
+        self.load_selected_tertiary_prompt()
+        self.capture_prompt_selection_settings()
+        self.write_runtime_config("tertiary_prompt_selection")
+
     def update_tertiary_status(self, prompt=None) -> None:
         if prompt is None:
             prompt = self.prompt_manager.get(self.current_tertiary_prompt_id())
@@ -5593,6 +7747,7 @@ class AssistantApp:
         tertiary_config = normalize_tertiary_analysis_config(self.config.get("tertiary_analysis", {}))
         tertiary_config["enabled"] = bool(self.tertiary_enabled_var.get())
         if self.current_tertiary_prompt_id():
+            tertiary_config["last_prompt_id"] = self.current_tertiary_prompt_id()
             tertiary_config["default_prompt_id"] = tertiary_config.get("default_prompt_id") or self.current_tertiary_prompt_id()
         self.config["tertiary_analysis"] = tertiary_config
         try:
@@ -5655,6 +7810,7 @@ class AssistantApp:
             return
         tertiary_config = normalize_tertiary_analysis_config(self.config.get("tertiary_analysis", {}))
         tertiary_config["default_prompt_id"] = prompt.id
+        tertiary_config["last_prompt_id"] = prompt.id
         self.config["tertiary_analysis"] = tertiary_config
         try:
             save_json(BASE_DIR / "config.json", self.config)
@@ -5674,6 +7830,8 @@ class AssistantApp:
         document_now_config = self.config.setdefault("document_now", {})
         selected = self.prompt_manager.get(selected_id) if selected_id else None
         if selected is None:
+            selected = self.prompt_manager.get(str(document_now_config.get("last_prompt_id") or ""))
+        if selected is None or selected.prompt_type != "generic":
             selected = self.prompt_manager.get(str(document_now_config.get("default_prompt_id") or ""))
         if selected is None:
             selected = self.prompt_manager.get(DOCUMENT_NOW_PROMPT_ID)
@@ -5694,6 +7852,47 @@ class AssistantApp:
         self.set_text(self.document_now_prompt_text, prompt.content)
         self.update_document_now_status(prompt=prompt)
         self.schedule_document_now_message_refresh()
+
+    def on_document_now_prompt_selected(self) -> None:
+        self.load_selected_document_now_prompt()
+        self.capture_prompt_selection_settings()
+        self.write_runtime_config("document_now_prompt_selection")
+
+    def get_document_now_default_prompt_prefix(self) -> str:
+        if hasattr(self, "document_now_default_prompt_text"):
+            return self.get_text(self.document_now_default_prompt_text).strip()
+        return str(
+            self.config.setdefault("document_now", {}).get("default_prompt_prefix")
+            or DEFAULT_DOCUMENT_NOW_PROMPT_PREFIX
+        ).strip()
+
+    def save_document_now_default_prompt(self) -> None:
+        self.capture_document_now_default_prompt_setting()
+        try:
+            save_json(BASE_DIR / "config.json", self.config)
+            self.document_now_status_var.set("Document maintenant: prompt défaut enregistré")
+        except Exception as exc:
+            self.log_debug("warning", "app", "document_now_default_prompt_prefix_save_error", str(exc))
+            self.document_now_status_var.set("Document maintenant: erreur sauvegarde prompt défaut")
+        self.schedule_document_now_message_refresh()
+
+    def reset_document_now_default_prompt(self) -> None:
+        if not messagebox.askyesno(
+            "Document maintenant",
+            "Réinitialiser le prompt par défaut ajouté au Document maintenant ?",
+            parent=self.root,
+        ):
+            return
+        if hasattr(self, "document_now_default_prompt_text"):
+            self.set_text(self.document_now_default_prompt_text, DEFAULT_DOCUMENT_NOW_PROMPT_PREFIX)
+        self.save_document_now_default_prompt()
+
+    def compose_document_now_prompt_content(self, prompt_content: str) -> str:
+        parts = [
+            self.get_document_now_default_prompt_prefix(),
+            str(prompt_content or "").strip(),
+        ]
+        return "\n\n".join(part for part in parts if part).strip()
 
     def update_document_now_status(self, prompt=None) -> None:
         if prompt is None:
@@ -5772,7 +7971,9 @@ class AssistantApp:
         prompt = self.prompt_manager.get(prompt_id)
         if not prompt:
             return
-        self.config.setdefault("document_now", {})["default_prompt_id"] = prompt.id
+        document_now_config = self.config.setdefault("document_now", {})
+        document_now_config["default_prompt_id"] = prompt.id
+        document_now_config["last_prompt_id"] = prompt.id
         try:
             save_json(BASE_DIR / "config.json", self.config)
         except Exception as exc:
@@ -5845,6 +8046,7 @@ class AssistantApp:
         )
         if prompt.is_default:
             self.sync_active_whisper_initial_prompt_config(prompt)
+        self.save_medical_transcription_settings()
         self._refresh_whisper_initial_prompt_combo(prompt.id)
         self.whisper_initial_prompt_status_var.set(f"Prompt Whisper enregistré: {prompt.name}")
         self.log_debug(
@@ -5854,6 +8056,50 @@ class AssistantApp:
             "Prompt initial Whisper enregistré.",
             {"prompt_name": prompt.name, "prompt_length": len(prompt.content or "")},
         )
+
+    def restore_default_whisper_medical_prompt(self) -> None:
+        self.set_text(self.whisper_initial_prompt_text, DEFAULT_WHISPER_INITIAL_PROMPT)
+        self.save_whisper_initial_prompt()
+        self.whisper_initial_prompt_status_var.set("Prompt Whisper médical par défaut restauré")
+
+    def save_medical_transcription_settings(self) -> None:
+        target = self.config.setdefault("medical_transcription", {})
+        target["include_weda_context_in_whisper_prompt"] = bool(self.whisper_include_weda_context_var.get())
+        target["use_dynamic_weda_hotwords"] = bool(self.whisper_use_dynamic_hotwords_var.get())
+        target["apply_validated_corrections"] = bool(self.whisper_apply_corrections_var.get())
+        if hasattr(self, "permanent_hotwords_text"):
+            target["permanent_hotwords"] = parse_permanent_hotwords(self.get_text(self.permanent_hotwords_text))
+        try:
+            save_json(BASE_DIR / "config.json", self.config)
+            self.whisper_initial_prompt_status_var.set("Réglages Whisper médical enregistrés")
+        except Exception as exc:
+            self.log_debug("error", "app", "medical_transcription_settings_save_error", str(exc))
+
+    def show_whisper_diagnostic_window(self) -> None:
+        settings = self.get_stt_settings()
+        diagnostics = settings.get("medical_whisper_diagnostics", {})
+        window = tk.Toplevel(self.root)
+        window.title("Diagnostic Whisper médical")
+        window.geometry("900x650")
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        text = self.create_text_widget(frame, wrap=tk.WORD, undo=False)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=scrollbar.set)
+        final_hotwords = diagnostics.get("final_hotwords", [])
+        content = (
+            "PROMPT FINAL TRANSMIS À WHISPER\n\n"
+            f"{diagnostics.get('final_prompt', '')}\n\n"
+            "HOTWORDS\n"
+            f"- permanents : {diagnostics.get('permanent_hotwords_count', 0)}\n"
+            f"- extraits de WEDA : {diagnostics.get('weda_hotwords_count', 0)}\n"
+            f"- corrections validées : {diagnostics.get('correction_hotwords_count', 0)}\n"
+            f"- total transmis : {len(final_hotwords)}\n\n"
+            + "\n".join(final_hotwords)
+        )
+        self.set_text(text, content, readonly=True)
 
     def duplicate_whisper_initial_prompt(self) -> None:
         prompt_id = self.current_whisper_initial_prompt_id()
@@ -5951,6 +8197,232 @@ class AssistantApp:
             self.update_abbreviations_status(entries=entries, errors=errors)
 
         return transformed
+
+    def result_source_key_for_document(self, document_index: int) -> str:
+        if document_index == 2:
+            return "result_2"
+        if document_index == 3:
+            return "result_3"
+        return "result_1"
+
+    def remember_weda_result_payload(self, source: str, text: str) -> RichTextPayload:
+        payload = format_weda_rich_text(text)
+        self.rich_result_payloads[source] = payload
+        self.generated_result_originals[source] = payload.text
+        binding = self.pending_result_patient_bindings.pop(source, None) or self.capture_current_patient_binding()
+        self.result_patient_bindings[source] = binding
+        return payload
+
+    def capture_current_patient_binding(self) -> dict:
+        context = self.context_manager.get_latest()
+        return {
+            "patient_id": normalize_patient_id(getattr(context, "patient_id", "")) if context else "",
+            "patient_identity": str(getattr(context, "patient_identity", "") or "") if context else "",
+            "context_received_at": str(getattr(context, "received_at", "") or "") if context else "",
+            "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+
+    def capture_pending_result_patient_binding(self, source: str) -> None:
+        self.pending_result_patient_bindings[source] = self.capture_current_patient_binding()
+
+    def discard_pending_result_patient_binding(self, source: str) -> None:
+        self.pending_result_patient_bindings.pop(source, None)
+
+    def get_result_text_by_source(self, source: str) -> str:
+        if source == "result_2":
+            return self.get_text(self.secondary_result_text).strip()
+        if source == "result_3":
+            return self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else ""
+        if source == "document_now":
+            return self.get_text(self.document_now_result_text).strip() if hasattr(self, "document_now_result_text") else ""
+        return self.get_text(self.result_text).strip()
+
+    def get_current_rich_result_payload(self, source: str) -> RichTextPayload:
+        text = self.get_result_text_by_source(source)
+        remembered = self.rich_result_payloads.get(source)
+        if remembered and remembered.text.strip() == text.strip():
+            return remembered
+        return format_weda_rich_text(text)
+
+    def get_result_payload_for_import(self, source: str = "result_1") -> RichTextPayload:
+        if source == "result_1_result_2":
+            return combine_weda_rich_text_payloads([
+                self.get_current_rich_result_payload("result_1"),
+                self.get_current_rich_result_payload("result_2"),
+            ])
+        if source == "result_1_result_2_result_3":
+            return combine_weda_rich_text_payloads([
+                self.get_current_rich_result_payload("result_1"),
+                self.get_current_rich_result_payload("result_2"),
+                self.get_current_rich_result_payload("result_3"),
+            ])
+        return self.get_current_rich_result_payload(source)
+
+    def copy_rich_result_source(self, source: str) -> bool:
+        widget = self.get_result_widget_by_source(source)
+        if widget is not None:
+            payload = self.get_rich_text_widget_payload(widget, source=source)
+        else:
+            payload = self.get_current_rich_result_payload(source)
+        return copy_rich_text_to_clipboard(payload.html, payload.text, self.root)
+
+    def get_result_widget_by_source(self, source: str) -> tk.Text | None:
+        if source == "result_2":
+            return self.secondary_result_text if hasattr(self, "secondary_result_text") else None
+        if source == "result_3":
+            return self.tertiary_result_text if hasattr(self, "tertiary_result_text") else None
+        if source == "document_now":
+            return self.document_now_result_text if hasattr(self, "document_now_result_text") else None
+        if source == "result_1":
+            return self.result_text if hasattr(self, "result_text") else None
+        return None
+
+    def install_rich_result_copy_bindings(self) -> None:
+        for source in ("result_1", "result_2", "result_3", "document_now"):
+            widget = self.get_result_widget_by_source(source)
+            if widget is None:
+                continue
+
+            self.configure_rich_result_tags(widget)
+            for sequence in ("<<Copy>>", "<Control-c>", "<Control-C>"):
+                widget.bind(sequence, lambda event, key=source: self.on_rich_result_copy(event, key))
+
+    def configure_rich_result_tags(self, widget: tk.Text) -> None:
+        widget.tag_configure(RICH_RESULT_BOLD_TAG, font=("Segoe UI", 10, "bold"))
+        widget.tag_configure(RICH_RESULT_UNDERLINE_TAG, underline=True)
+        widget.tag_configure(RICH_RESULT_ITALIC_TAG, font=("Segoe UI", 10, "italic"))
+        widget.tag_configure(RICH_RESULT_STRIKE_TAG, overstrike=True)
+
+    def set_rich_result_text(self, widget: tk.Text, payload: RichTextPayload, *, source: str = "") -> None:
+        state = str(widget.cget("state"))
+        if state == tk.DISABLED:
+            widget.configure(state=tk.NORMAL)
+
+        self.configure_rich_result_tags(widget)
+        widget.delete("1.0", tk.END)
+        for segment_text, tag_names in self.parse_rich_payload_for_tk(payload):
+            start = widget.index(tk.INSERT)
+            widget.insert(tk.INSERT, segment_text)
+            end = widget.index(tk.INSERT)
+            for tag_name in tag_names:
+                widget.tag_add(tag_name, start, end)
+
+        if state == tk.DISABLED:
+            widget.configure(state=tk.DISABLED)
+
+        if source:
+            self.rich_result_payloads[source] = payload
+        self.schedule_text_widget_dependents(widget)
+
+    def parse_rich_payload_for_tk(self, payload: RichTextPayload) -> list[tuple[str, tuple[str, ...]]]:
+        fragment = payload.html or ""
+        if fragment:
+            parser = RichHtmlToTkParser()
+            try:
+                parser.feed(fragment)
+                parser.close()
+            except Exception:
+                return [(payload.text or "", ())]
+            if parser.segments:
+                return parser.segments
+
+        return [(payload.text or "", ())]
+
+    def on_rich_result_copy(self, event, source: str):
+        widget = event.widget if isinstance(event.widget, tk.Text) else self.get_result_widget_by_source(source)
+        if widget is None:
+            return "break"
+
+        payload = self.get_rich_text_widget_payload(widget, source=source, prefer_selection=True)
+        ok = copy_rich_text_to_clipboard(payload.html, payload.text, self.root)
+        self.set_rich_copy_status(source, ok)
+        return "break"
+
+    def get_rich_text_widget_payload(
+        self,
+        widget: tk.Text,
+        *,
+        source: str = "",
+        prefer_selection: bool = False,
+    ) -> RichTextPayload:
+        selected_range = self.get_text_selection_range(widget) if prefer_selection else None
+        if selected_range is not None:
+            start, end = selected_range
+        else:
+            start, end = "1.0", "end-1c"
+
+        text = widget.get(start, end)
+        if not text:
+            return RichTextPayload(text="", html="")
+
+        if self.range_has_rich_result_tags(widget, start, end):
+            return RichTextPayload(
+                text=text,
+                html=self.serialize_rich_text_widget_range(widget, start, end),
+            )
+
+        if not selected_range and source:
+            remembered = self.rich_result_payloads.get(source)
+            if remembered and remembered.text.strip() == text.strip():
+                return remembered
+
+        return format_weda_rich_text(text)
+
+    def get_text_selection_range(self, widget: tk.Text) -> tuple[str, str] | None:
+        try:
+            return widget.index("sel.first"), widget.index("sel.last")
+        except tk.TclError:
+            return None
+
+    def range_has_rich_result_tags(self, widget: tk.Text, start: str, end: str) -> bool:
+        if any(tag_name in widget.tag_names(start) for tag_name in RICH_RESULT_TK_TAGS):
+            return True
+
+        try:
+            return any(
+                event_type in ("tagon", "tagoff") and tag_name in RICH_RESULT_TK_TAGS
+                for event_type, tag_name, _index in widget.dump(start, end, tag=True)
+            )
+        except tk.TclError:
+            return False
+
+    def serialize_rich_text_widget_range(self, widget: tk.Text, start: str, end: str) -> str:
+        active_tags = set(tag_name for tag_name in widget.tag_names(start) if tag_name in RICH_RESULT_TK_TAGS)
+        fragments: list[str] = []
+
+        try:
+            dump = widget.dump(start, end, text=True, tag=True)
+        except tk.TclError:
+            dump = []
+
+        for event_type, value, _index in dump:
+            if event_type == "tagon" and value in RICH_RESULT_TK_TAGS:
+                active_tags.add(value)
+            elif event_type == "tagoff" and value in RICH_RESULT_TK_TAGS:
+                active_tags.discard(value)
+            elif event_type == "text":
+                fragments.append(self.wrap_rich_html_text(value, active_tags))
+
+        return "".join(fragments)
+
+    def wrap_rich_html_text(self, value: str, active_tags: set[str]) -> str:
+        fragment = html.escape(value, quote=False).replace("\n", "<br>")
+        for tag_name, html_tag in reversed(RICH_RESULT_TK_TAG_TO_HTML):
+            if tag_name in active_tags:
+                fragment = f"<{html_tag}>{fragment}</{html_tag}>"
+        return fragment
+
+    def set_rich_copy_status(self, source: str, ok: bool) -> None:
+        if source == "result_2":
+            self.secondary_status_var.set("Résultat 2 WEDA copié" if ok else "Copie Résultat 2 impossible")
+        elif source == "result_3":
+            self.tertiary_status_var.set("Résultat 3 WEDA copié" if ok else "Copie Résultat 3 impossible")
+        elif source == "document_now":
+            self.document_now_status_var.set(
+                "Document maintenant: résultat WEDA copié" if ok else "Document maintenant: copie impossible"
+            )
+        else:
+            self.import_status_var.set("Résultat WEDA copié" if ok else "Copie impossible")
 
     def update_abbreviations_status(
         self,
@@ -6263,6 +8735,222 @@ class AssistantApp:
             max_tokens=int(configured_max_tokens) if configured_max_tokens else None,
         )
 
+    def refresh_lmstudio_context_window_async(self) -> None:
+        lm_config = self.config.get("lmstudio", {})
+        url = str(lm_config.get("url") or "http://localhost:1234/v1/chat/completions")
+        model = str(lm_config.get("model") or "local-model")
+        timeout_seconds = min(8, max(1, int(lm_config.get("timeout_seconds") or 120)))
+
+        def worker():
+            try:
+                context = fetch_lmstudio_model_context(url, model=model, timeout_seconds=timeout_seconds)
+                self.root.after(0, self.on_lmstudio_context_window_detected, context)
+            except Exception as exc:
+                self.root.after(0, self.on_lmstudio_context_window_error, exc)
+
+        threading.Thread(target=worker, name="lmstudio-context-detect", daemon=True).start()
+
+    def on_lmstudio_context_window_detected(self, context) -> None:
+        if not context or not getattr(context, "context_length", 0):
+            self.log_debug("warning", "app", "lmstudio_context_window_missing", "Fenêtre de contexte LM Studio non détectée.")
+            return
+
+        self.lmstudio_context_window_tokens = int(context.context_length)
+        self.lmstudio_context_window_model = str(context.model or "")
+        self.lmstudio_context_window_source = str(context.source or "")
+        self.lmstudio_status_var.set(f"LM Studio: contexte {self.lmstudio_context_window_tokens} tokens")
+        self.log_debug(
+            "info",
+            "app",
+            "lmstudio_context_window_detected",
+            "Fenêtre de contexte LM Studio détectée.",
+            {
+                "model": self.lmstudio_context_window_model,
+                "context_length": self.lmstudio_context_window_tokens,
+                "max_context_length": getattr(context, "max_context_length", None),
+                "source": self.lmstudio_context_window_source,
+                "models_url": getattr(context, "models_url", ""),
+            },
+        )
+
+    def on_lmstudio_context_window_error(self, error: Exception) -> None:
+        self.lmstudio_context_window_tokens = 0
+        self.lmstudio_context_window_model = ""
+        self.lmstudio_context_window_source = ""
+        self.log_debug("warning", "app", "lmstudio_context_window_error", str(error))
+
+    def get_lmstudio_context_window_tokens(self) -> int:
+        if self.lmstudio_context_window_tokens > 0:
+            return self.lmstudio_context_window_tokens
+        lm_config = self.config.get("lmstudio", {})
+        for key in ("context_window_tokens", "context_window_fallback_tokens"):
+            try:
+                value = int(lm_config.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
+    def estimate_lmstudio_tokens(self, text: str) -> int:
+        lm_config = self.config.get("lmstudio", {})
+        try:
+            chars_per_token = float(lm_config.get("context_estimated_chars_per_token") or LMSTUDIO_CONTEXT_ESTIMATED_CHARS_PER_TOKEN)
+        except (TypeError, ValueError):
+            chars_per_token = LMSTUDIO_CONTEXT_ESTIMATED_CHARS_PER_TOKEN
+        chars_per_token = max(1.5, min(chars_per_token, 8.0))
+        return int((len(text or "") / chars_per_token) + 0.999)
+
+    def get_lmstudio_input_budget_tokens(self, *, max_tokens: int | None = None) -> int:
+        context_tokens = self.get_lmstudio_context_window_tokens()
+        if context_tokens <= 0:
+            return 0
+
+        lm_config = self.config.get("lmstudio", {})
+        try:
+            margin_tokens = int(lm_config.get("context_safety_margin_tokens") or LMSTUDIO_CONTEXT_SAFETY_MARGIN_TOKENS)
+        except (TypeError, ValueError):
+            margin_tokens = LMSTUDIO_CONTEXT_SAFETY_MARGIN_TOKENS
+        try:
+            reserve_tokens = int(
+                max_tokens
+                or lm_config.get("context_response_reserve_tokens")
+                or lm_config.get("max_tokens")
+                or LMSTUDIO_CONTEXT_RESPONSE_RESERVE_TOKENS
+            )
+        except (TypeError, ValueError):
+            reserve_tokens = LMSTUDIO_CONTEXT_RESPONSE_RESERVE_TOKENS
+
+        margin_tokens = max(128, min(margin_tokens, max(128, context_tokens // 4)))
+        reserve_tokens = max(256, min(reserve_tokens, max(256, context_tokens // 3)))
+        system_tokens = self.estimate_lmstudio_tokens(str(lm_config.get("default_system_prompt") or "Tu es un assistant médical local."))
+        return max(LMSTUDIO_CONTEXT_MIN_INPUT_TOKENS, context_tokens - margin_tokens - reserve_tokens - system_tokens)
+
+    def truncate_lmstudio_text_tail(self, text: str, excess_tokens: int) -> str:
+        value = str(text or "")
+        if not value:
+            return ""
+        lm_config = self.config.get("lmstudio", {})
+        try:
+            chars_per_token = float(lm_config.get("context_estimated_chars_per_token") or LMSTUDIO_CONTEXT_ESTIMATED_CHARS_PER_TOKEN)
+        except (TypeError, ValueError):
+            chars_per_token = LMSTUDIO_CONTEXT_ESTIMATED_CHARS_PER_TOKEN
+        marker = "\n\n[... contenu ancien tronqué pour respecter la fenêtre de contexte LM Studio ...]"
+        chars_to_remove = max(256, int(max(1, excess_tokens) * max(1.5, min(chars_per_token, 8.0))) + len(marker) + 64)
+        keep_chars = max(0, len(value) - chars_to_remove)
+        if keep_chars < 160:
+            return ""
+        return value[:keep_chars].rstrip() + marker
+
+    def apply_lmstudio_context_limit(
+        self,
+        prompt_content: str,
+        variables: dict[str, str],
+        render_message,
+        *,
+        label: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        working_variables = dict(variables)
+        message = render_message(working_variables).strip()
+        budget_tokens = self.get_lmstudio_input_budget_tokens(max_tokens=max_tokens)
+        if budget_tokens <= 0:
+            return message, working_variables
+
+        token_count = self.estimate_lmstudio_tokens(message)
+        if token_count <= budget_tokens:
+            return message, working_variables
+
+        alias_groups = [
+            ("weda_context",),
+            ("attachments", "uploaded_files"),
+            ("result_1", "lmstudio_result"),
+            ("result_2",),
+            ("result_3",),
+            ("document_now_result",),
+            ("transcription", "snapshot_transcription", "snapshot_de_transcription"),
+        ]
+        truncated_keys = []
+
+        for aliases in alias_groups:
+            values = [str(working_variables.get(alias) or "") for alias in aliases]
+            current_value = next((value for value in values if value), "")
+            if not current_value:
+                continue
+
+            for _attempt in range(6):
+                excess_tokens = max(1, token_count - budget_tokens)
+                next_value = self.truncate_lmstudio_text_tail(current_value, excess_tokens)
+                if next_value == current_value:
+                    next_value = ""
+                for alias in aliases:
+                    if working_variables.get(alias):
+                        working_variables[alias] = next_value
+                truncated_keys.extend(alias for alias in aliases if alias not in truncated_keys)
+                message = render_message(working_variables).strip()
+                token_count = self.estimate_lmstudio_tokens(message)
+                current_value = next_value
+                if token_count <= budget_tokens or not current_value:
+                    break
+
+            if token_count <= budget_tokens:
+                break
+
+        if token_count > budget_tokens:
+            message = self.truncate_lmstudio_text_tail(message, token_count - budget_tokens).strip()
+            truncated_keys.append("_message_final")
+            token_count = self.estimate_lmstudio_tokens(message)
+
+        self.log_debug(
+            "warning",
+            "app",
+            "lmstudio_message_context_truncated",
+            "Message LM Studio tronqué pour respecter la fenêtre de contexte.",
+            {
+                "label": label,
+                "context_window_tokens": self.get_lmstudio_context_window_tokens(),
+                "budget_tokens": budget_tokens,
+                "estimated_tokens_after": token_count,
+                "truncated_keys": truncated_keys,
+                "prompt_mentions_weda_context": self.prompt_contains_variable(prompt_content, "weda_context"),
+            },
+        )
+        if truncated_keys:
+            self.lmstudio_status_var.set(f"LM Studio: contexte tronqué ({token_count}/{budget_tokens} tokens estimés)")
+        return message, working_variables
+
+    def adjust_lmstudio_client_for_context(self, client: LmStudioClient, message: str, *, label: str = "") -> None:
+        context_tokens = self.get_lmstudio_context_window_tokens()
+        if context_tokens <= 0:
+            return
+
+        lm_config = self.config.get("lmstudio", {})
+        try:
+            margin_tokens = int(lm_config.get("context_safety_margin_tokens") or LMSTUDIO_CONTEXT_SAFETY_MARGIN_TOKENS)
+        except (TypeError, ValueError):
+            margin_tokens = LMSTUDIO_CONTEXT_SAFETY_MARGIN_TOKENS
+        input_tokens = self.estimate_lmstudio_tokens(str(client.system_prompt or "") + "\n" + str(message or ""))
+        available_output_tokens = context_tokens - input_tokens - max(128, margin_tokens)
+        if available_output_tokens <= 0:
+            client.max_tokens = 128
+            return
+        if client.max_tokens and client.max_tokens > available_output_tokens:
+            previous = client.max_tokens
+            client.max_tokens = max(128, int(available_output_tokens))
+            self.log_debug(
+                "warning",
+                "app",
+                "lmstudio_max_tokens_capped",
+                "max_tokens LM Studio ajusté à la fenêtre de contexte.",
+                {
+                    "label": label,
+                    "previous_max_tokens": previous,
+                    "effective_max_tokens": client.max_tokens,
+                    "context_window_tokens": context_tokens,
+                    "estimated_input_tokens": input_tokens,
+                },
+            )
+
     def is_secondary_auto_run_enabled(self) -> bool:
         secondary_config = normalize_secondary_analysis_config(self.config.get("secondary_analysis", {}))
         return bool(self.secondary_enabled_var.get() and secondary_config.get("auto_run_after_primary", True))
@@ -6272,15 +8960,66 @@ class AssistantApp:
         return bool(self.tertiary_enabled_var.get() and tertiary_config.get("auto_run_after_secondary", True))
 
     def send_to_lmstudio(self) -> None:
+        session = self.pending_dictation_session()
+        if session:
+            self.send_to_lmstudio_after_dictation_flush(session)
+            return
+        self.send_current_message_to_lmstudio()
+
+    def send_to_lmstudio_after_dictation_flush(self, session) -> None:
+        session_was_recording = bool(session and session.is_running())
+        if session_was_recording:
+            self.stop_dictation()
+
+        self.lmstudio_status_var.set("LM Studio: attente transcription complète")
+        self.transcription_status_var.set("Transcription: finalisation avant LM Studio")
+        self.set_dictation_buttons_waiting()
+        self.start_lmstudio_spinner(LMSTUDIO_MAIN_SPINNER_KEY)
+        self.start_lmstudio_spinner(LMSTUDIO_RESULT_RETRY_SPINNER_KEY)
+        self.log_debug(
+            "info",
+            "app",
+            "lmstudio_waiting_transcription_flush",
+            "Envoi LM Studio différé jusqu’à la fin complète de la transcription.",
+            {"session_was_recording": session_was_recording},
+        )
+
+        def worker():
+            try:
+                self.wait_for_dictation_transcription(session)
+                def ui_send_after_flush():
+                    self.set_dictation_buttons_running(False)
+                    self.send_current_message_to_lmstudio()
+
+                self.call_ui_sync(ui_send_after_flush, timeout_seconds=20)
+            except Exception as exc:
+                def ui_error_after_flush(error=exc):
+                    self.set_dictation_buttons_running(False)
+                    self.on_lmstudio_error(error)
+
+                self.root.after(0, ui_error_after_flush)
+
+        threading.Thread(target=worker, name="lmstudio-after-dictation-flush", daemon=True).start()
+
+    def send_current_message_to_lmstudio(self) -> None:
+        if self.is_lmstudio_request_active("document_1"):
+            self.lmstudio_status_var.set("LM Studio: Document 1 déjà en cours")
+            return
+        if self.include_context_var.get() and not self.require_fresh_patient_context("Génération du Document 1"):
+            return
         message = self.refresh_sent_message().strip()
         if not message:
+            self.stop_lmstudio_spinner(LMSTUDIO_MAIN_SPINNER_KEY)
+            self.stop_lmstudio_spinner(LMSTUDIO_RESULT_RETRY_SPINNER_KEY)
             messagebox.showwarning("LM Studio", "Le message à envoyer est vide.", parent=self.root)
             return
 
         lm_config = self.config.get("lmstudio", {})
         client = self.build_lmstudio_client()
+        self.adjust_lmstudio_client_for_context(client, message, label="message_principal")
         self.lmstudio_status_var.set("LM Studio: envoi en cours")
         self.start_lmstudio_spinner(LMSTUDIO_MAIN_SPINNER_KEY)
+        self.start_lmstudio_spinner(LMSTUDIO_RESULT_RETRY_SPINNER_KEY)
         if self.secondary_enabled_var.get():
             self.set_text(self.secondary_result_text, "")
             self.set_text(self.secondary_sent_message_text, "", readonly=True)
@@ -6301,19 +9040,30 @@ class AssistantApp:
             },
         )
 
-        def worker():
-            try:
-                response = client.chat(message)
-                self.root.after(0, self.on_lmstudio_response, response, message)
-            except Exception as exc:
-                self.root.after(0, self.on_lmstudio_error, exc)
-
-        threading.Thread(target=worker, name="lmstudio-request", daemon=True).start()
+        self.launch_lmstudio_request(
+            "document_1",
+            client,
+            message,
+            on_success=lambda response: self.on_lmstudio_response(response, message),
+            on_error=self.on_lmstudio_error,
+            thread_name="lmstudio-request",
+            result_source="result_1",
+        )
 
     def on_lmstudio_response(self, response, sent_message: str) -> None:
         self.stop_lmstudio_spinner(LMSTUDIO_MAIN_SPINNER_KEY)
+        self.stop_lmstudio_spinner(LMSTUDIO_RESULT_RETRY_SPINNER_KEY)
         result_text = self.apply_abbreviations_to_lmstudio_result(response.text, "Résultat 1")
-        self.set_text(self.result_text, result_text)
+        result_payload = self.remember_weda_result_payload("result_1", result_text)
+        self.record_generation_metric(
+            "document_1",
+            "result_1",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message or ""),
+            result_chars=len(result_payload.text or ""),
+        )
+        self.set_rich_result_text(self.result_text, result_payload, source="result_1")
         self.select_tab_containing_widget(self.result_text)
         self.lmstudio_status_var.set(f"LM Studio: réponse reçue en {response.elapsed_seconds:.1f}s")
         self.log_debug(
@@ -6324,21 +9074,22 @@ class AssistantApp:
             {
                 "elapsed_seconds": response.elapsed_seconds,
                 "raw_result_length": len(response.text or ""),
-                "result_length": len(result_text or ""),
+                "result_length": len(result_payload.text or ""),
+                "result_html_length": len(result_payload.html or ""),
             },
         )
         if self.is_secondary_auto_run_enabled():
             self.run_secondary_analysis(
                 trigger="auto",
                 primary_sent_message=sent_message,
-                primary_result=result_text,
+                primary_result=result_payload.text,
             )
             return
 
         status = "disabled" if not self.secondary_enabled_var.get() else "skipped_no_result_1"
         self.append_analysis_history(
             sent_message_1=sent_message,
-            result_1=result_text,
+            result_1=result_payload.text,
             prompt_2_status=status,
             prompt_3_status="skipped_no_result_2" if self.tertiary_enabled_var.get() else "disabled",
         )
@@ -6404,6 +9155,10 @@ class AssistantApp:
         if self.secondary_running:
             self.secondary_status_var.set("Prompt 2: déjà en cours")
             return
+        if self.context_manager.get_latest() is not None and not self.require_fresh_patient_context("Prompt 2"):
+            return
+        if not self.validate_result_for_current_patient("result_1", "Prompt 2"):
+            return
 
         result_1 = primary_result if primary_result is not None else self.get_text(self.result_text).strip()
         if not result_1:
@@ -6419,7 +9174,7 @@ class AssistantApp:
             return
 
         if primary_result is not None:
-            self.set_text(self.result_text, primary_result)
+            self.set_rich_result_text(self.result_text, format_weda_rich_text(primary_result), source="result_1")
 
         try:
             message_2, variables = self.build_secondary_lmstudio_message()
@@ -6440,7 +9195,9 @@ class AssistantApp:
         self.set_text(self.secondary_sent_message_text, message_2, readonly=True)
         self.secondary_status_var.set("Prompt 2: envoi en cours")
         self.secondary_running = True
+        self.start_lmstudio_spinner(LMSTUDIO_SECONDARY_RETRY_SPINNER_KEY)
         client = self.build_lmstudio_client()
+        self.adjust_lmstudio_client_for_context(client, message_2, label="prompt_2")
         sent_message_1 = primary_sent_message or self.get_text(self.sent_message_text)
 
         self.log_debug(
@@ -6456,30 +9213,27 @@ class AssistantApp:
             },
         )
 
-        def worker():
-            try:
-                response = client.chat(message_2)
-                self.root.after(
-                    0,
-                    self.on_secondary_lmstudio_response,
-                    response,
-                    message_2,
-                    sent_message_1,
-                    result_1,
-                    trigger,
-                )
-            except Exception as exc:
-                self.root.after(
-                    0,
-                    self.on_secondary_lmstudio_error,
-                    exc,
-                    message_2,
-                    sent_message_1,
-                    result_1,
-                    trigger,
-                )
-
-        threading.Thread(target=worker, name="lmstudio-secondary-request", daemon=True).start()
+        self.launch_lmstudio_request(
+            "document_2",
+            client,
+            message_2,
+            on_success=lambda response: self.on_secondary_lmstudio_response(
+                response,
+                message_2,
+                sent_message_1,
+                result_1,
+                trigger,
+            ),
+            on_error=lambda error: self.on_secondary_lmstudio_error(
+                error,
+                message_2,
+                sent_message_1,
+                result_1,
+                trigger,
+            ),
+            thread_name="lmstudio-secondary-request",
+            result_source="result_2",
+        )
 
     def on_secondary_lmstudio_response(
         self,
@@ -6490,8 +9244,18 @@ class AssistantApp:
         trigger: str,
     ) -> None:
         self.secondary_running = False
+        self.stop_lmstudio_spinner(LMSTUDIO_SECONDARY_RETRY_SPINNER_KEY)
         result_2_text = self.apply_abbreviations_to_lmstudio_result(response.text, "Résultat 2")
-        self.set_text(self.secondary_result_text, result_2_text)
+        result_2_payload = self.remember_weda_result_payload("result_2", result_2_text)
+        self.record_generation_metric(
+            "document_2",
+            "result_2",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message_2 or ""),
+            result_chars=len(result_2_payload.text or ""),
+        )
+        self.set_rich_result_text(self.secondary_result_text, result_2_payload, source="result_2")
         self.select_tab_containing_widget(self.secondary_result_text)
         self.secondary_status_var.set(f"Prompt 2: réponse reçue en {response.elapsed_seconds:.1f}s")
         self.log_debug(
@@ -6503,7 +9267,8 @@ class AssistantApp:
                 "trigger": trigger,
                 "elapsed_seconds": response.elapsed_seconds,
                 "raw_result_2_length": len(response.text or ""),
-                "result_2_length": len(result_2_text or ""),
+                "result_2_length": len(result_2_payload.text or ""),
+                "result_2_html_length": len(result_2_payload.html or ""),
             },
         )
         self.schedule_tertiary_message_refresh()
@@ -6513,7 +9278,7 @@ class AssistantApp:
                 sent_message_1=sent_message_1,
                 result_1=result_1,
                 sent_message_2=sent_message_2,
-                result_2=result_2_text,
+                result_2=result_2_payload.text,
                 prompt_2_status="manual_run" if trigger == "manual_run" else "success",
             )
             return
@@ -6522,7 +9287,7 @@ class AssistantApp:
             result_1=result_1,
             prompt_2_status="manual_run" if trigger == "manual_run" else "success",
             message_sent_2=sent_message_2,
-            result_2=result_2_text,
+            result_2=result_2_payload.text,
             prompt_3_status="disabled" if not self.tertiary_enabled_var.get() else "skipped_no_result_2",
         )
 
@@ -6535,6 +9300,28 @@ class AssistantApp:
         trigger: str,
     ) -> None:
         self.secondary_running = False
+        self.discard_pending_result_patient_binding("result_2")
+        self.stop_lmstudio_spinner(LMSTUDIO_SECONDARY_RETRY_SPINNER_KEY)
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric(
+                "document_2",
+                "result_2",
+                status="cancelled",
+                input_chars=len(sent_message_2 or ""),
+                error=error,
+            )
+            self.secondary_status_var.set("Prompt 2: génération annulée")
+            if self.tertiary_enabled_var.get():
+                self.tertiary_status_var.set("Prompt 3: non lancé")
+            self.log_debug("info", "app", "secondary_lmstudio_cancelled", str(error), {"trigger": trigger})
+            return
+        self.record_generation_metric(
+            "document_2",
+            "result_2",
+            status="error",
+            input_chars=len(sent_message_2 or ""),
+            error=error,
+        )
         message = f"Erreur Prompt 2 : {error}"
         self.set_text(self.secondary_result_text, message)
         self.select_tab_containing_widget(self.secondary_result_text)
@@ -6568,6 +9355,10 @@ class AssistantApp:
         if self.tertiary_running:
             self.tertiary_status_var.set("Prompt 3: déjà en cours")
             return
+        if self.context_manager.get_latest() is not None and not self.require_fresh_patient_context("Prompt 3"):
+            return
+        if not self.validate_result_for_current_patient("result_1_result_2", "Prompt 3"):
+            return
 
         result_1_text = result_1 if result_1 is not None else self.get_text(self.result_text).strip()
         result_2_text = result_2 if result_2 is not None else self.get_text(self.secondary_result_text).strip()
@@ -6587,9 +9378,9 @@ class AssistantApp:
             return
 
         if result_1 is not None:
-            self.set_text(self.result_text, result_1_text)
+            self.set_rich_result_text(self.result_text, format_weda_rich_text(result_1_text), source="result_1")
         if result_2 is not None:
-            self.set_text(self.secondary_result_text, result_2_text)
+            self.set_rich_result_text(self.secondary_result_text, format_weda_rich_text(result_2_text), source="result_2")
 
         try:
             message_3, variables = self.build_tertiary_lmstudio_message()
@@ -6613,7 +9404,9 @@ class AssistantApp:
         self.set_text(self.tertiary_sent_message_text, message_3, readonly=True)
         self.tertiary_status_var.set("Prompt 3: envoi en cours")
         self.tertiary_running = True
+        self.start_lmstudio_spinner(LMSTUDIO_TERTIARY_RETRY_SPINNER_KEY)
         client = self.build_lmstudio_client()
+        self.adjust_lmstudio_client_for_context(client, message_3, label="prompt_3")
         sent_message_1_text = sent_message_1 or self.get_text(self.sent_message_text)
         sent_message_2_text = sent_message_2 or self.get_text(self.secondary_sent_message_text)
 
@@ -6631,36 +9424,33 @@ class AssistantApp:
             },
         )
 
-        def worker():
-            try:
-                response = client.chat(message_3)
-                self.root.after(
-                    0,
-                    self.on_tertiary_lmstudio_response,
-                    response,
-                    message_3,
-                    sent_message_1_text,
-                    result_1_text,
-                    sent_message_2_text,
-                    result_2_text,
-                    prompt_2_status,
-                    trigger,
-                )
-            except Exception as exc:
-                self.root.after(
-                    0,
-                    self.on_tertiary_lmstudio_error,
-                    exc,
-                    message_3,
-                    sent_message_1_text,
-                    result_1_text,
-                    sent_message_2_text,
-                    result_2_text,
-                    prompt_2_status,
-                    trigger,
-                )
-
-        threading.Thread(target=worker, name="lmstudio-tertiary-request", daemon=True).start()
+        self.launch_lmstudio_request(
+            "document_3",
+            client,
+            message_3,
+            on_success=lambda response: self.on_tertiary_lmstudio_response(
+                response,
+                message_3,
+                sent_message_1_text,
+                result_1_text,
+                sent_message_2_text,
+                result_2_text,
+                prompt_2_status,
+                trigger,
+            ),
+            on_error=lambda error: self.on_tertiary_lmstudio_error(
+                error,
+                message_3,
+                sent_message_1_text,
+                result_1_text,
+                sent_message_2_text,
+                result_2_text,
+                prompt_2_status,
+                trigger,
+            ),
+            thread_name="lmstudio-tertiary-request",
+            result_source="result_3",
+        )
 
     def on_tertiary_lmstudio_response(
         self,
@@ -6674,8 +9464,18 @@ class AssistantApp:
         trigger: str,
     ) -> None:
         self.tertiary_running = False
+        self.stop_lmstudio_spinner(LMSTUDIO_TERTIARY_RETRY_SPINNER_KEY)
         result_3_text = self.apply_abbreviations_to_lmstudio_result(response.text, "Résultat 3")
-        self.set_text(self.tertiary_result_text, result_3_text)
+        result_3_payload = self.remember_weda_result_payload("result_3", result_3_text)
+        self.record_generation_metric(
+            "document_3",
+            "result_3",
+            status="success",
+            elapsed_seconds=response.elapsed_seconds,
+            input_chars=len(sent_message_3 or ""),
+            result_chars=len(result_3_payload.text or ""),
+        )
+        self.set_rich_result_text(self.tertiary_result_text, result_3_payload, source="result_3")
         self.select_tab_containing_widget(self.tertiary_result_text)
         self.tertiary_status_var.set(f"Prompt 3: réponse reçue en {response.elapsed_seconds:.1f}s")
         self.log_debug(
@@ -6687,7 +9487,8 @@ class AssistantApp:
                 "trigger": trigger,
                 "elapsed_seconds": response.elapsed_seconds,
                 "raw_result_3_length": len(response.text or ""),
-                "result_3_length": len(result_3_text or ""),
+                "result_3_length": len(result_3_payload.text or ""),
+                "result_3_html_length": len(result_3_payload.html or ""),
             },
         )
         self.append_analysis_history(
@@ -6698,7 +9499,7 @@ class AssistantApp:
             result_2=result_2,
             prompt_3_status="manual_run" if trigger == "manual_run" else "success",
             message_sent_3=sent_message_3,
-            result_3=result_3_text,
+            result_3=result_3_payload.text,
         )
 
     def on_tertiary_lmstudio_error(
@@ -6713,6 +9514,26 @@ class AssistantApp:
         trigger: str,
     ) -> None:
         self.tertiary_running = False
+        self.discard_pending_result_patient_binding("result_3")
+        self.stop_lmstudio_spinner(LMSTUDIO_TERTIARY_RETRY_SPINNER_KEY)
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric(
+                "document_3",
+                "result_3",
+                status="cancelled",
+                input_chars=len(sent_message_3 or ""),
+                error=error,
+            )
+            self.tertiary_status_var.set("Prompt 3: génération annulée")
+            self.log_debug("info", "app", "tertiary_lmstudio_cancelled", str(error), {"trigger": trigger})
+            return
+        self.record_generation_metric(
+            "document_3",
+            "result_3",
+            status="error",
+            input_chars=len(sent_message_3 or ""),
+            error=error,
+        )
         message = f"Erreur Prompt 3 : {error}"
         self.set_text(self.tertiary_result_text, message)
         self.select_tab_containing_widget(self.tertiary_result_text)
@@ -6733,6 +9554,18 @@ class AssistantApp:
 
     def on_lmstudio_error(self, error: Exception) -> None:
         self.stop_lmstudio_spinner(LMSTUDIO_MAIN_SPINNER_KEY)
+        self.discard_pending_result_patient_binding("result_1")
+        self.stop_lmstudio_spinner(LMSTUDIO_RESULT_RETRY_SPINNER_KEY)
+        if self.lmstudio_request_was_cancelled(error):
+            self.record_generation_metric("document_1", "result_1", status="cancelled", error=error)
+            self.lmstudio_status_var.set("LM Studio: génération annulée")
+            if self.secondary_enabled_var.get():
+                self.secondary_status_var.set("Prompt 2: non lancé")
+            if self.tertiary_enabled_var.get():
+                self.tertiary_status_var.set("Prompt 3: non lancé")
+            self.log_debug("info", "app", "lmstudio_cancelled", str(error))
+            return
+        self.record_generation_metric("document_1", "result_1", status="error", error=error)
         self.lmstudio_status_var.set("LM Studio: erreur")
         if self.secondary_enabled_var.get():
             self.secondary_status_var.set("Prompt 2: non lancé, erreur Prompt 1")
@@ -6741,19 +9574,247 @@ class AssistantApp:
         self.log_debug("error", "app", "lmstudio_error", str(error))
         messagebox.showerror("LM Studio", str(error), parent=self.root)
 
+    def current_patient_safety_state(self, *, require_patient_id: bool = False):
+        return evaluate_patient_context(
+            self.context_manager.get_latest(),
+            require_patient_id=require_patient_id,
+        )
+
+    def update_patient_safety_banner(self) -> None:
+        state = self.current_patient_safety_state()
+        self.patient_safety_title_var.set(state.title)
+        self.patient_safety_detail_var.set(state.detail)
+        if not hasattr(self, "patient_safety_bar"):
+            return
+        palette = {
+            PATIENT_SAFETY_OK: ("#12372a", "#15803d", "PRÊT", "#bbf7d0"),
+            "warning": ("#3b2f0b", "#a16207", "ATTENTION", "#fde68a"),
+            PATIENT_SAFETY_BLOCKED: ("#3b1014", "#991b1b", "VERROUILLÉ", "#fecaca"),
+        }
+        background, badge, badge_text, detail_color = palette.get(state.level, palette[PATIENT_SAFETY_BLOCKED])
+        self.patient_safety_bar.configure(bg=background)
+        self.patient_safety_badge.configure(bg=badge, text=badge_text)
+        self.patient_safety_title_label.configure(bg=background)
+        self.patient_safety_detail_label.configure(bg=background, fg=detail_color)
+
+    def require_fresh_patient_context(self, action: str, *, require_patient_id: bool = False) -> bool:
+        state = self.current_patient_safety_state(require_patient_id=require_patient_id)
+        self.update_patient_safety_banner()
+        allowed = state.allows_import if require_patient_id else state.allows_generation
+        if allowed:
+            return True
+        if hasattr(self, "context_text"):
+            self.select_tab_containing_widget(self.context_text)
+        messagebox.showerror(
+            "Verrou patient WEDA",
+            f"{action} bloqué.\n\n{state.title}\n{state.detail}",
+            parent=self.root,
+        )
+        return False
+
+    def result_binding_sources(self, source: str) -> list[str]:
+        if source == "result_1_result_2":
+            return ["result_1", "result_2"]
+        if source == "result_1_result_2_result_3":
+            return ["result_1", "result_2", "result_3"]
+        return [source]
+
+    def validate_result_patient_binding(self, source: str) -> bool:
+        if not self.require_fresh_patient_context("Import WEDA", require_patient_id=True):
+            return False
+        context = self.context_manager.get_latest()
+        current_patient_id = normalize_patient_id(getattr(context, "patient_id", ""))
+        for key in self.result_binding_sources(source):
+            binding = self.result_patient_bindings.get(key)
+            if not binding or not normalize_patient_id(binding.get("patient_id")):
+                messagebox.showerror(
+                    "Verrou patient WEDA",
+                    "Import bloqué : ce résultat n’est pas rattaché à un dossier WEDA vérifié.\n"
+                    "Régénère-le après avoir récupéré le contexte du patient.",
+                    parent=self.root,
+                )
+                return False
+            if not patient_ids_match(binding.get("patient_id"), current_patient_id):
+                messagebox.showerror(
+                    "Verrou patient WEDA",
+                    "Import bloqué : le dossier WEDA a changé depuis la génération de ce résultat.\n"
+                    "Le résultat reste visible, mais ne peut pas être rattaché au nouveau patient.",
+                    parent=self.root,
+                )
+                self.patient_safety_title_var.set("Dossier changé — résultat précédent verrouillé")
+                self.patient_safety_detail_var.set("Régénère le document pour le patient actuellement affiché.")
+                return False
+        return True
+
+    def validate_result_for_current_patient(self, source: str, action: str) -> bool:
+        context = self.context_manager.get_latest()
+        if context is None:
+            return True
+        current_patient_id = normalize_patient_id(getattr(context, "patient_id", ""))
+        for key in self.result_binding_sources(source):
+            binding = self.result_patient_bindings.get(key)
+            bound_patient_id = normalize_patient_id(binding.get("patient_id")) if binding else ""
+            if bound_patient_id and current_patient_id and not patient_ids_match(bound_patient_id, current_patient_id):
+                messagebox.showerror(
+                    "Verrou patient WEDA",
+                    f"{action} bloqué : le résultat source appartient au dossier WEDA précédent.",
+                    parent=self.root,
+                )
+                return False
+        return True
+
     def refresh_context_from_manager(self) -> None:
         context = self.context_manager.get_latest()
         if not context:
             self.weda_patient_status_var.set("Patient WEDA: non reçu")
+            self.update_patient_safety_banner()
             return
         self.set_text(self.context_text, context.to_prompt_text())
         patient_label = context.patient_identity or context.patient_name or context.patient_id or "reçu"
         self.weda_patient_status_var.set(f"Patient WEDA: {patient_label[:40]}")
+        self.update_patient_safety_banner()
+
+    def request_weda_context_refresh(self) -> dict:
+        job = {
+            "id": uuid.uuid4().hex,
+            "status": "pending",
+            "message": "Demande envoyée à l’onglet WEDA visible.",
+            "requested_at": time.time(),
+        }
+        with self._weda_context_refresh_lock:
+            self.weda_context_refresh_job = job
+        self.weda_patient_status_var.set("Patient WEDA: actualisation demandée…")
+        self.log_debug(
+            "info",
+            "app",
+            "weda_context_refresh_requested",
+            "Nouvelle collecte du contexte demandée à WEDA.",
+            {"request_id": job["id"]},
+        )
+        self.root.after(
+            WEDA_CONTEXT_REFRESH_TIMEOUT_MS,
+            lambda request_id=job["id"]: self.expire_weda_context_refresh(request_id),
+        )
+        return dict(job)
+
+    def get_weda_context_refresh_request(self) -> dict | None:
+        with self._weda_context_refresh_lock:
+            return dict(self.weda_context_refresh_job) if self.weda_context_refresh_job else None
+
+    def claim_weda_context_refresh(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        request_id = str(payload.get("request_id") or payload.get("requestId") or "")
+        responder_id = str(payload.get("responder_id") or payload.get("responderId") or "")
+        with self._weda_context_refresh_lock:
+            job = dict(self.weda_context_refresh_job or {})
+            if not job or job.get("id") != request_id:
+                return {"claimed": False, "reason": "request_not_found"}
+            current_responder = str(job.get("responder_id") or "")
+            if job.get("status") == "collecting" and current_responder == responder_id:
+                return {"claimed": True, "job": job}
+            if job.get("status") != "pending":
+                return {"claimed": False, "reason": str(job.get("status") or "not_pending"), "job": job}
+            job.update(
+                {
+                    "status": "collecting",
+                    "message": "Collecte en cours dans WEDA.",
+                    "responder_id": responder_id,
+                    "page_url": str(payload.get("page_url") or ""),
+                    "claimed_at": time.time(),
+                }
+            )
+            self.weda_context_refresh_job = job
+
+        self.root.after(0, self.weda_patient_status_var.set, "Patient WEDA: collecte en cours…")
+        self.log_debug(
+            "info",
+            "app",
+            "weda_context_refresh_claimed",
+            "Demande de contexte prise en charge par un onglet WEDA.",
+            {"request_id": request_id, "page_url": job.get("page_url", "")},
+        )
+        return {"claimed": True, "job": dict(job)}
+
+    def acknowledge_weda_context_refresh(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        request_id = str(payload.get("request_id") or payload.get("requestId") or "")
+        responder_id = str(payload.get("responder_id") or payload.get("responderId") or "")
+        success = str(payload.get("status") or "").lower() == "success"
+        with self._weda_context_refresh_lock:
+            job = dict(self.weda_context_refresh_job or {})
+            if not job or job.get("id") != request_id:
+                return {"accepted": False, "reason": "request_not_found"}
+            if job.get("responder_id") and responder_id != job.get("responder_id"):
+                return {"accepted": False, "reason": "responder_mismatch", "job": job}
+            job.update(
+                {
+                    "status": "done" if success else "error",
+                    "message": (
+                        "Contexte WEDA actualisé."
+                        if success
+                        else str(payload.get("error") or "La collecte WEDA a échoué.")
+                    ),
+                    "completed_at": time.time(),
+                    "visible_text_length": int(payload.get("visible_text_length") or 0),
+                    "patient_id_present": bool(payload.get("patient_id_present")),
+                }
+            )
+            self.weda_context_refresh_job = job
+
+        def update_ui():
+            if success:
+                self.refresh_context_from_manager()
+                context = self.context_manager.get_latest()
+                patient_label = (
+                    context.patient_identity or context.patient_name or context.patient_id or "reçu"
+                    if context
+                    else "non reçu"
+                )
+                self.weda_patient_status_var.set(f"Patient WEDA: {patient_label[:32]} — contexte actualisé")
+            else:
+                self.weda_patient_status_var.set("Patient WEDA: échec de l’actualisation")
+
+        self.root.after(0, update_ui)
+        self.log_debug(
+            "info" if success else "error",
+            "app",
+            "weda_context_refresh_acknowledged",
+            job["message"],
+            {
+                "request_id": request_id,
+                "visible_text_length": job.get("visible_text_length", 0),
+                "patient_id_present": job.get("patient_id_present", False),
+            },
+        )
+        return {"accepted": True, "job": dict(job)}
+
+    def expire_weda_context_refresh(self, request_id: str) -> None:
+        with self._weda_context_refresh_lock:
+            job = dict(self.weda_context_refresh_job or {})
+            if not job or job.get("id") != request_id or job.get("status") not in {"pending", "collecting"}:
+                return
+            job.update(
+                {
+                    "status": "timeout",
+                    "message": "Aucun onglet WEDA visible n’a répondu à la demande.",
+                    "completed_at": time.time(),
+                }
+            )
+            self.weda_context_refresh_job = job
+        self.weda_patient_status_var.set("Patient WEDA: aucun onglet n’a répondu")
+        self.log_debug(
+            "warning",
+            "app",
+            "weda_context_refresh_timeout",
+            job["message"],
+            {"request_id": request_id},
+        )
 
     def clear_context(self) -> None:
         self.context_manager.clear()
         self.set_text(self.context_text, "")
         self.weda_patient_status_var.set("Patient WEDA: non reçu")
+        self.update_patient_safety_banner()
 
     def on_server_context(self, _context) -> None:
         self.log_debug(
@@ -6785,26 +9846,13 @@ class AssistantApp:
         self.root.after(0, self.log_status_var.set, "Logs: événement reçu")
 
     def get_result_text_for_import(self, source: str = "result_1") -> str:
-        result_1 = self.get_text(self.result_text).strip()
-        result_2 = self.get_text(self.secondary_result_text).strip()
-        result_3 = self.get_text(self.tertiary_result_text).strip() if hasattr(self, "tertiary_result_text") else ""
-        document_now_result = (
-            self.get_text(self.document_now_result_text).strip() if hasattr(self, "document_now_result_text") else ""
-        )
-        if source == "result_2":
-            return result_2
-        if source == "result_3":
-            return result_3
-        if source == "document_now":
-            return document_now_result
-        if source == "result_1_result_2":
-            return "\n\n".join(part for part in (result_1, result_2) if part).strip()
-        if source == "result_1_result_2_result_3":
-            return "\n\n".join(part for part in (result_1, result_2, result_3) if part).strip()
-        return result_1
+        return self.get_result_payload_for_import(source).text
 
     def prepare_weda_import(self, source: str = "result_1") -> None:
-        result = self.get_result_text_for_import(source)
+        if not self.validate_result_patient_binding(source):
+            return
+        result_payload = self.get_result_payload_for_import(source)
+        result = result_payload.text
         if not result:
             label = {
                 "result_2": "Résultat 2",
@@ -6815,9 +9863,11 @@ class AssistantApp:
             }.get(source, "résultat LM Studio")
             messagebox.showwarning("Import WEDA", f"Le {label} est vide.", parent=self.root)
             return
+        self.record_import_correction_metrics(source)
         context = self.context_manager.get_latest()
         request = self.import_manager.prepare_result(
             result,
+            result_html=result_payload.html,
             patient_id=context.patient_id if context else "",
             patient_identity=context.patient_identity if context else "",
             destination="active_field",
@@ -6833,6 +9883,7 @@ class AssistantApp:
                 "patient_id": request.patient_id,
                 "patient_identity": request.patient_identity,
                 "result_length": len(result),
+                "result_html_length": len(result_payload.html or ""),
                 "source": source,
                 "destination": request.destination,
             },
@@ -6873,41 +9924,188 @@ class AssistantApp:
         self.prepare_weda_import(source="document_now")
 
     def copy_result(self) -> None:
-        ok = copy_text_to_clipboard(self.get_text(self.result_text), self.root)
-        self.import_status_var.set("Résultat copié" if ok else "Copie impossible")
+        ok = self.copy_rich_result_source("result_1")
+        self.import_status_var.set("Résultat WEDA copié" if ok else "Copie impossible")
 
     def copy_secondary_result(self) -> None:
-        ok = copy_text_to_clipboard(self.get_text(self.secondary_result_text), self.root)
-        self.secondary_status_var.set("Résultat 2 copié" if ok else "Copie Résultat 2 impossible")
+        ok = self.copy_rich_result_source("result_2")
+        self.secondary_status_var.set("Résultat 2 WEDA copié" if ok else "Copie Résultat 2 impossible")
 
     def copy_tertiary_result(self) -> None:
-        ok = copy_text_to_clipboard(self.get_text(self.tertiary_result_text), self.root)
-        self.tertiary_status_var.set("Résultat 3 copié" if ok else "Copie Résultat 3 impossible")
+        ok = self.copy_rich_result_source("result_3")
+        self.tertiary_status_var.set("Résultat 3 WEDA copié" if ok else "Copie Résultat 3 impossible")
 
     def copy_transcription(self) -> None:
-        ok = copy_text_to_clipboard(self.get_clean_transcription_text(), self.root)
-        self.transcription_status_var.set("Transcription copiée" if ok else "Copie impossible")
+        raw = clean_transcription_text(
+            self.get_text(self.transcription_text), self.config.get("transcription_cleaning", {})
+        )
+        ok = copy_text_to_clipboard(raw, self.root)
+        self.transcription_status_var.set("Transcription brute copiée" if ok else "Copie impossible")
 
     def clear_transcription(self) -> None:
         self.set_text(self.transcription_text, "")
+        if hasattr(self, "corrected_transcription_text"):
+            self.set_text(self.corrected_transcription_text, "")
+        if hasattr(self, "correction_review_text"):
+            self.set_text(self.correction_review_text, "", readonly=True)
+        self.pending_transcription_corrections = []
+        self.transcription_draft_store.clear()
         self.transcription_status_var.set("Transcription prête")
+
+    def reset_corrected_transcription(self) -> None:
+        raw = self.get_text(self.transcription_text)
+        self.set_text(self.corrected_transcription_text, raw)
+        self.pending_transcription_corrections = []
+        self.set_text(self.correction_review_text, "Aucune correction en attente.", readonly=True)
+        self.transcription_status_var.set("Couche corrigée réalignée sur la transcription brute")
+
+    def review_transcription_corrections(self) -> None:
+        raw = self.get_text(self.transcription_text)
+        corrected = self.get_text(self.corrected_transcription_text)
+        self.pending_transcription_corrections = propose_corrections(raw, corrected)
+        self.set_text(
+            self.correction_review_text,
+            format_correction_review(raw, corrected),
+            readonly=True,
+        )
+        self.transcription_status_var.set(
+            f"{len(self.pending_transcription_corrections)} correction(s) proposée(s), non encore apprise(s)"
+        )
+
+    def validate_transcription_corrections(self) -> None:
+        self.review_transcription_corrections()
+        if not self.pending_transcription_corrections:
+            messagebox.showinfo("Corrections locales", "Aucune correction lexicale à valider.", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "Valider les corrections",
+            f"Mémoriser localement {len(self.pending_transcription_corrections)} correction(s) affichée(s) ?",
+            parent=self.root,
+        ):
+            return
+        model = str((self.last_stt_result or {}).get("model") or "")
+        for proposal in self.pending_transcription_corrections:
+            category = self.guess_transcription_correction_category(proposal.correction)
+            self.correction_store.validate(
+                proposal.source,
+                proposal.correction,
+                context_before=proposal.context_before,
+                context_after=proposal.context_after,
+                category=category,
+                whisper_model=model,
+            )
+        count = len(self.pending_transcription_corrections)
+        self.pending_transcription_corrections = []
+        self.save_medical_transcription_settings()
+        self.set_text(self.correction_review_text, f"{count} correction(s) validée(s) et mémorisée(s) localement.", readonly=True)
+        self.transcription_status_var.set(f"{count} correction(s) validée(s)")
+        self.log_debug(
+            "info",
+            "transcription",
+            "transcription_corrections_validated",
+            "Corrections de transcription validées explicitement.",
+            {"count": count},
+        )
+
+    def reject_transcription_corrections(self) -> None:
+        self.review_transcription_corrections()
+        if not self.pending_transcription_corrections:
+            return
+        for proposal in self.pending_transcription_corrections:
+            self.correction_store.reject(
+                proposal.source,
+                proposal.correction,
+                context_before=proposal.context_before,
+                context_after=proposal.context_after,
+            )
+        count = len(self.pending_transcription_corrections)
+        self.pending_transcription_corrections = []
+        self.set_text(self.correction_review_text, f"{count} correction(s) rejetée(s), aucune n’a été apprise.", readonly=True)
+        self.transcription_status_var.set(f"{count} correction(s) rejetée(s)")
+
+    def guess_transcription_correction_category(self, correction: str) -> str:
+        value = str(correction or "")
+        normalized = value.casefold()
+        if any(marker in normalized for marker in ("ine", "ol", "pril", "sartan", "mab", "xaban")):
+            return "medicament"
+        if any(marker in normalized for marker in ("émie", "urie", "hémoglobine", "bnp", "créatin")):
+            return "biologie"
+        if value[:1].isupper():
+            return "nom_propre"
+        return "autre"
+
+    def restore_last_transcription(self) -> None:
+        draft = self.transcription_draft_store.load()
+        if not draft:
+            return
+        self.set_text(self.transcription_text, draft.text)
+        if hasattr(self, "corrected_transcription_text"):
+            corrected = draft.text
+            if bool(self.config.get("medical_transcription", {}).get("apply_validated_corrections", False)):
+                corrected, _count = self.correction_store.apply_conservative(
+                    corrected,
+                    min_validations=int(
+                        self.config.get("medical_transcription", {}).get(
+                            "min_validations_for_automatic_correction",
+                            MIN_VALIDATIONS_FOR_AUTOMATIC_CORRECTION,
+                        )
+                    ),
+                )
+            self.set_text(self.corrected_transcription_text, corrected)
+        self.transcription_status_var.set("Transcription restaurée depuis la dernière fermeture")
+        self.log_debug(
+            "info",
+            "app",
+            "transcription_draft_restored",
+            "Dernière transcription restaurée.",
+            {"saved_at": draft.saved_at, "text_length": len(draft.text)},
+        )
+
+    def save_last_transcription(self) -> None:
+        text = self.get_text(self.transcription_text)
+        draft = self.transcription_draft_store.save(text)
+        self.log_debug(
+            "info",
+            "app",
+            "transcription_draft_saved" if draft else "transcription_draft_cleared",
+            "Dernière transcription conservée pour le prochain lancement."
+            if draft
+            else "Aucune transcription à conserver.",
+            {"text_length": len(text)},
+        )
 
     def clear_result(self) -> None:
         self.set_text(self.result_text, "")
+        self.rich_result_payloads.pop("result_1", None)
+        self.result_patient_bindings.pop("result_1", None)
+        self.generated_result_originals.pop("result_1", None)
+        self.result_generation_metadata.pop("result_1", None)
         self.lmstudio_status_var.set("LM Studio: prêt")
         self.schedule_secondary_message_refresh()
         self.schedule_tertiary_message_refresh()
 
     def clear_secondary_result(self) -> None:
         self.set_text(self.secondary_result_text, "")
+        self.rich_result_payloads.pop("result_2", None)
+        self.result_patient_bindings.pop("result_2", None)
+        self.generated_result_originals.pop("result_2", None)
+        self.result_generation_metadata.pop("result_2", None)
         self.secondary_status_var.set("Prompt 2: résultat effacé")
         if hasattr(self, "tertiary_result_text"):
             self.set_text(self.tertiary_result_text, "")
+            self.rich_result_payloads.pop("result_3", None)
+            self.result_patient_bindings.pop("result_3", None)
+            self.generated_result_originals.pop("result_3", None)
+            self.result_generation_metadata.pop("result_3", None)
             self.tertiary_status_var.set("Prompt 3: en attente du Résultat 2")
         self.schedule_tertiary_message_refresh()
 
     def clear_tertiary_result(self) -> None:
         self.set_text(self.tertiary_result_text, "")
+        self.rich_result_payloads.pop("result_3", None)
+        self.result_patient_bindings.pop("result_3", None)
+        self.generated_result_originals.pop("result_3", None)
+        self.result_generation_metadata.pop("result_3", None)
         self.tertiary_status_var.set("Prompt 3: résultat effacé")
         self.schedule_tertiary_message_refresh()
 
@@ -6919,6 +10117,7 @@ class AssistantApp:
         self.pdf_source_var.set("Résultat 1")
         self.save_pdf_source_preference()
         self.result_destination_var.set("PDF structuré")
+        self.on_result_destination_changed()
         if hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
         self.pdf_status_var.set("PDF: source Résultat 1 sélectionnée")
@@ -6931,6 +10130,7 @@ class AssistantApp:
         self.pdf_source_var.set("Résultat 2")
         self.save_pdf_source_preference()
         self.result_destination_var.set("PDF structuré")
+        self.on_result_destination_changed()
         if hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
         self.pdf_status_var.set("PDF: source Résultat 2 sélectionnée")
@@ -6943,6 +10143,7 @@ class AssistantApp:
         self.pdf_source_var.set("Résultat 3")
         self.save_pdf_source_preference()
         self.result_destination_var.set("PDF structuré")
+        self.on_result_destination_changed()
         if hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
         self.pdf_status_var.set("PDF: source Résultat 3 sélectionnée")
@@ -6955,6 +10156,7 @@ class AssistantApp:
         self.pdf_source_var.set("Document maintenant")
         self.save_pdf_source_preference()
         self.result_destination_var.set("PDF structuré")
+        self.on_result_destination_changed()
         if hasattr(self, "pdf_tab_frame"):
             self.notebook.select(self.pdf_tab_frame)
         self.pdf_status_var.set("PDF: source Document maintenant sélectionnée")
@@ -6990,6 +10192,410 @@ class AssistantApp:
         self.debug_logger.append("info", "app", "logs_cleared", "Logs effacés depuis l’application.")
         self.refresh_logs()
 
+    def show_diagnostic_window(self) -> None:
+        if self.diagnostic_window and self.diagnostic_window.winfo_exists():
+            self.diagnostic_window.deiconify()
+            self.diagnostic_window.lift()
+            self.run_diagnostics_async()
+            return
+        window = tk.Toplevel(self.root)
+        self.diagnostic_window = window
+        window.title("Diagnostic DrFloW")
+        window.geometry("900x560")
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", lambda: self.close_diagnostic_window())
+
+        header = ttk.Frame(window, padding=10)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Santé du système", style="Title.TLabel").pack(side=tk.LEFT)
+        self.diagnostic_status_var = tk.StringVar(value="Vérification en cours…")
+        ttk.Label(header, textvariable=self.diagnostic_status_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(header, text="Copier rapport anonymisé", command=self.copy_diagnostic_report).pack(side=tk.RIGHT)
+        ttk.Button(header, text="Relancer", command=self.run_diagnostics_async).pack(side=tk.RIGHT, padx=(0, 6))
+
+        columns = ("status", "name", "detail")
+        tree = ttk.Treeview(window, columns=columns, show="headings", height=18)
+        self.diagnostic_tree = tree
+        tree.heading("status", text="État")
+        tree.heading("name", text="Contrôle")
+        tree.heading("detail", text="Détail")
+        tree.column("status", width=90, anchor=tk.CENTER, stretch=False)
+        tree.column("name", width=210, stretch=False)
+        tree.column("detail", width=560)
+        tree.tag_configure("ok", foreground="#86efac")
+        tree.tag_configure("warning", foreground="#fde68a")
+        tree.tag_configure("error", foreground="#fca5a5")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.diagnostic_results = []
+        self.run_diagnostics_async()
+
+    def close_diagnostic_window(self) -> None:
+        if self.diagnostic_window and self.diagnostic_window.winfo_exists():
+            self.diagnostic_window.destroy()
+        self.diagnostic_window = None
+
+    def run_diagnostics_async(self) -> None:
+        if not self.diagnostic_window or not self.diagnostic_window.winfo_exists():
+            return
+        self.diagnostic_status_var.set("Vérification en cours…")
+        self.diagnostic_tree.delete(*self.diagnostic_tree.get_children())
+        config_snapshot = json.loads(json.dumps(self.config))
+        patient_state = self.current_patient_safety_state().level
+        lm_config = config_snapshot.get("lmstudio", {})
+
+        def lmstudio_probe() -> str:
+            context = fetch_lmstudio_model_context(
+                str(lm_config.get("url") or "http://localhost:1234/v1/chat/completions"),
+                model=str(lm_config.get("model") or "local-model"),
+                timeout_seconds=5,
+            )
+            if context is None:
+                return "API joignable • fenêtre de contexte non annoncée"
+            return f"API joignable • {context.context_length} tokens"
+
+        def worker():
+            results = run_drflow_diagnostics(
+                base_dir=BASE_DIR,
+                data_dir=self.data_dir,
+                config=config_snapshot,
+                microphone_count=len(self.micro_device_options),
+                server_running=bool(self.server),
+                fly_hotkey_ready=bool(self._fly_dictation_hook_handles),
+                stt_label=str(self.stt_status_var.get() or self.model_manager.active_label()),
+                patient_context_state=patient_state,
+                lmstudio_probe=lmstudio_probe,
+            )
+            self.root.after(0, self.render_diagnostic_results, results)
+
+        threading.Thread(target=worker, name="drflow-diagnostics", daemon=True).start()
+
+    def render_diagnostic_results(self, results) -> None:
+        if not self.diagnostic_window or not self.diagnostic_window.winfo_exists():
+            return
+        self.diagnostic_results = list(results)
+        self.diagnostic_tree.delete(*self.diagnostic_tree.get_children())
+        labels = {"ok": "OK", "warning": "ATTENTION", "error": "ERREUR"}
+        for item in results:
+            self.diagnostic_tree.insert(
+                "",
+                tk.END,
+                values=(labels.get(item.status, item.status.upper()), item.name, item.detail),
+                tags=(item.status,),
+            )
+        errors = sum(1 for item in results if item.status == "error")
+        warnings = sum(1 for item in results if item.status == "warning")
+        self.diagnostic_status_var.set(f"{len(results)} contrôles • {errors} erreur(s) • {warnings} attention(s)")
+
+    def copy_diagnostic_report(self) -> None:
+        report = sanitized_diagnostic_report(getattr(self, "diagnostic_results", []))
+        ok = copy_text_to_clipboard(report, self.root)
+        if hasattr(self, "diagnostic_status_var"):
+            self.diagnostic_status_var.set("Rapport anonymisé copié" if ok else "Copie impossible")
+
+    def show_quality_window(self) -> None:
+        if self.quality_window and self.quality_window.winfo_exists():
+            self.quality_window.deiconify()
+            self.quality_window.lift()
+            self.refresh_quality_window()
+            return
+        window = tk.Toplevel(self.root)
+        self.quality_window = window
+        window.title("Versions, comparaisons et qualité")
+        window.geometry("1120x720")
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self.close_quality_window)
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.build_prompt_versions_tab(notebook)
+        self.build_result_comparison_tab(notebook)
+        self.build_quality_metrics_tab(notebook)
+        self.refresh_quality_window()
+
+    def close_quality_window(self) -> None:
+        if self.quality_window and self.quality_window.winfo_exists():
+            self.quality_window.destroy()
+        self.quality_window = None
+
+    def build_prompt_versions_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Versions de prompts")
+        controls = ttk.Frame(frame)
+        controls.pack(fill=tk.X, pady=(0, 8))
+        self.version_prompt_var = tk.StringVar(value="")
+        self.version_left_var = tk.StringVar(value="")
+        self.version_right_var = tk.StringVar(value="")
+        ttk.Label(controls, text="Prompt").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        self.version_prompt_combo = ttk.Combobox(controls, textvariable=self.version_prompt_var, width=42, state="readonly")
+        self.version_prompt_combo.grid(row=0, column=1, sticky=tk.EW, padx=(0, 8))
+        self.version_prompt_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_prompt_version_choices())
+        ttk.Label(controls, text="Version A").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
+        self.version_left_combo = ttk.Combobox(controls, textvariable=self.version_left_var, width=31, state="readonly")
+        self.version_left_combo.grid(row=0, column=3, sticky=tk.EW, padx=(0, 8))
+        ttk.Label(controls, text="Version B").grid(row=0, column=4, sticky=tk.W, padx=(0, 4))
+        self.version_right_combo = ttk.Combobox(controls, textvariable=self.version_right_var, width=31, state="readonly")
+        self.version_right_combo.grid(row=0, column=5, sticky=tk.EW, padx=(0, 8))
+        ttk.Button(controls, text="Comparer", command=self.compare_prompt_versions).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(controls, text="Restaurer A", command=self.restore_selected_prompt_version).grid(row=0, column=7)
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+        controls.columnconfigure(5, weight=1)
+        self.prompt_version_diff_text = self.create_text_widget(frame, wrap=tk.NONE, undo=False)
+        self.prompt_version_diff_text.pack(fill=tk.BOTH, expand=True)
+        self.configure_diff_tags(self.prompt_version_diff_text)
+
+    def build_result_comparison_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Comparer les résultats")
+        controls = ttk.Frame(frame)
+        controls.pack(fill=tk.X, pady=(0, 8))
+        self.result_compare_left_var = tk.StringVar(value="Résultat 1")
+        self.result_compare_right_var = tk.StringVar(value="Résultat 2")
+        choices = ["Résultat 1", "Résultat 2", "Résultat 3", "Document maintenant", "Transcription"]
+        ttk.Label(controls, text="Texte A").pack(side=tk.LEFT)
+        ttk.Combobox(
+            controls,
+            textvariable=self.result_compare_left_var,
+            values=choices,
+            width=24,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(controls, text="Texte B").pack(side=tk.LEFT)
+        ttk.Combobox(
+            controls,
+            textvariable=self.result_compare_right_var,
+            values=choices,
+            width=24,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(controls, text="Comparer maintenant", command=self.compare_live_results).pack(side=tk.LEFT)
+        self.result_diff_text = self.create_text_widget(frame, wrap=tk.NONE, undo=False)
+        self.result_diff_text.pack(fill=tk.BOTH, expand=True)
+        self.configure_diff_tags(self.result_diff_text)
+
+    def build_quality_metrics_tab(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Métriques locales")
+        header = ttk.Frame(frame)
+        header.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            header,
+            text="Uniquement des nombres et états techniques sont conservés — aucun texte ni identifiant patient.",
+        ).pack(side=tk.LEFT)
+        ttk.Button(header, text="Actualiser", command=self.refresh_quality_metrics).pack(side=tk.RIGHT)
+        columns = ("workflow", "prompt", "runs", "success", "errors", "latency", "correction")
+        self.quality_metrics_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        headings = {
+            "workflow": "Workflow",
+            "prompt": "Prompt",
+            "runs": "Générations",
+            "success": "Succès",
+            "errors": "Erreurs/annulations",
+            "latency": "Durée moyenne",
+            "correction": "Correction moyenne",
+        }
+        widths = {"workflow": 130, "prompt": 280, "runs": 90, "success": 70, "errors": 130, "latency": 120, "correction": 140}
+        for key in columns:
+            self.quality_metrics_tree.heading(key, text=headings[key])
+            self.quality_metrics_tree.column(key, width=widths[key], anchor=tk.W if key in {"workflow", "prompt"} else tk.CENTER)
+        self.quality_metrics_tree.pack(fill=tk.BOTH, expand=True)
+
+    def refresh_quality_window(self) -> None:
+        if not self.quality_window or not self.quality_window.winfo_exists():
+            return
+        prompts = list(self.prompt_manager.list_prompts()) + list(self.whisper_initial_prompt_manager.list_prompts())
+        self.version_prompt_label_to_id = {}
+        labels = []
+        for prompt in prompts:
+            label = f"{prompt.name} [{prompt.prompt_type}] • {prompt.id[:8]}"
+            self.version_prompt_label_to_id[label] = prompt.id
+            labels.append(label)
+        self.version_prompt_combo["values"] = labels
+        if labels and self.version_prompt_var.get() not in labels:
+            self.version_prompt_var.set(labels[0])
+        self.refresh_prompt_version_choices()
+        self.refresh_quality_metrics()
+
+    def refresh_prompt_version_choices(self) -> None:
+        prompt_id = getattr(self, "version_prompt_label_to_id", {}).get(self.version_prompt_var.get(), "")
+        versions = self.prompt_version_store.list_versions(prompt_id)
+        self.version_label_to_entry = {
+            f"{item.label} • {item.version_id[:6]}": item
+            for item in versions
+        }
+        labels = list(self.version_label_to_entry)
+        self.version_left_combo["values"] = labels
+        self.version_right_combo["values"] = labels
+        if labels:
+            self.version_left_var.set(labels[-2] if len(labels) > 1 else labels[0])
+            self.version_right_var.set(labels[-1])
+            self.compare_prompt_versions()
+        else:
+            self.version_left_var.set("")
+            self.version_right_var.set("")
+            self.set_text(self.prompt_version_diff_text, "Aucune version enregistrée.", readonly=True)
+
+    def compare_prompt_versions(self) -> None:
+        left = getattr(self, "version_label_to_entry", {}).get(self.version_left_var.get())
+        right = getattr(self, "version_label_to_entry", {}).get(self.version_right_var.get())
+        if not left or not right:
+            return
+        diff = unified_text_diff(left.content, right.content, left_label=left.label, right_label=right.label)
+        self.set_text(self.prompt_version_diff_text, diff, readonly=True)
+        self.apply_diff_tags(self.prompt_version_diff_text)
+
+    def restore_selected_prompt_version(self) -> None:
+        version = getattr(self, "version_label_to_entry", {}).get(self.version_left_var.get())
+        if not version:
+            return
+        if not messagebox.askyesno(
+            "Restaurer un prompt",
+            f"Restaurer la version du {version.at.replace('T', ' ')[:19]} ?\n"
+            "La version actuelle restera conservée dans l’historique.",
+            parent=self.quality_window,
+        ):
+            return
+        manager = self.prompt_manager if self.prompt_manager.get(version.prompt_id) else self.whisper_initial_prompt_manager
+        manager.update(version.prompt_id, content=version.content)
+        self.refresh_common_prompt_combos()
+        self._refresh_pdf_prompt_combo()
+        self._refresh_whisper_initial_prompt_combo()
+        self.refresh_quality_window()
+
+    def live_comparison_text(self, label: str) -> str:
+        mapping = {
+            "Résultat 1": lambda: self.get_text(self.result_text),
+            "Résultat 2": lambda: self.get_text(self.secondary_result_text),
+            "Résultat 3": lambda: self.get_text(self.tertiary_result_text),
+            "Document maintenant": lambda: self.get_text(self.document_now_result_text),
+            "Transcription": self.get_clean_transcription_text,
+        }
+        getter = mapping.get(label)
+        return getter() if getter else ""
+
+    def compare_live_results(self) -> None:
+        left_label = self.result_compare_left_var.get()
+        right_label = self.result_compare_right_var.get()
+        diff = unified_text_diff(
+            self.live_comparison_text(left_label),
+            self.live_comparison_text(right_label),
+            left_label=left_label,
+            right_label=right_label,
+        )
+        self.set_text(self.result_diff_text, diff, readonly=True)
+        self.apply_diff_tags(self.result_diff_text)
+
+    def configure_diff_tags(self, widget: tk.Text) -> None:
+        widget.tag_configure("diff_add", foreground="#86efac")
+        widget.tag_configure("diff_remove", foreground="#fca5a5")
+        widget.tag_configure("diff_header", foreground="#93c5fd", font=("Consolas", 10, "bold"))
+
+    def apply_diff_tags(self, widget: tk.Text) -> None:
+        state = str(widget.cget("state"))
+        if state == tk.DISABLED:
+            widget.configure(state=tk.NORMAL)
+        for line_number, line in enumerate(widget.get("1.0", tk.END).splitlines(), start=1):
+            tag = ""
+            if line.startswith(("+++", "---", "@@")):
+                tag = "diff_header"
+            elif line.startswith("+"):
+                tag = "diff_add"
+            elif line.startswith("-"):
+                tag = "diff_remove"
+            if tag:
+                widget.tag_add(tag, f"{line_number}.0", f"{line_number}.end")
+        if state == tk.DISABLED:
+            widget.configure(state=tk.DISABLED)
+
+    def refresh_quality_metrics(self) -> None:
+        if not hasattr(self, "quality_metrics_tree"):
+            return
+        self.quality_metrics_tree.delete(*self.quality_metrics_tree.get_children())
+        for item in self.quality_metrics_store.summary():
+            latency = "—" if item["average_latency"] is None else f"{item['average_latency']:.2f} s"
+            correction = (
+                "—"
+                if item["average_correction_percent"] is None
+                else f"{item['average_correction_percent']:.1f} %"
+            )
+            self.quality_metrics_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    item["workflow"],
+                    item["prompt_name"],
+                    item["generations"],
+                    item["successes"],
+                    item["errors"],
+                    latency,
+                    correction,
+                ),
+            )
+
+    def quality_prompt_metadata(self, workflow: str) -> tuple[str, str, str]:
+        prompt = None
+        if workflow in {"document_1", "connector"}:
+            prompt = self.prompt_manager.get(self.current_prompt_id())
+        elif workflow == "document_2":
+            prompt = self.prompt_manager.get(self.current_secondary_prompt_id())
+        elif workflow == "document_3":
+            prompt = self.prompt_manager.get(self.current_tertiary_prompt_id())
+        elif workflow == "document_now":
+            prompt = self.prompt_manager.get(self.current_document_now_prompt_id())
+        elif workflow == "pdf_form":
+            prompt = self.prompt_manager.get(self.current_pdf_prompt_id())
+        if not prompt:
+            return "", "Sans prompt", ""
+        return prompt.id, prompt.name, content_hash(prompt.content)
+
+    def record_generation_metric(
+        self,
+        workflow: str,
+        source: str,
+        *,
+        status: str,
+        elapsed_seconds: float | None = None,
+        input_chars: int = 0,
+        result_chars: int = 0,
+        error: Exception | None = None,
+    ) -> dict:
+        prompt_id, prompt_name, prompt_version = self.quality_prompt_metadata(workflow)
+        entry = self.quality_metrics_store.record_generation(
+            workflow=workflow,
+            source=source,
+            prompt_id=prompt_id,
+            prompt_name=prompt_name,
+            prompt_version=prompt_version,
+            status=status,
+            elapsed_seconds=elapsed_seconds,
+            input_chars=input_chars,
+            result_chars=result_chars,
+            error_type=type(error).__name__ if error else "",
+        )
+        if status == "success" and source:
+            self.result_generation_metadata[source] = entry
+        return entry
+
+    def record_import_correction_metrics(self, source: str) -> None:
+        for key in self.result_binding_sources(source):
+            metadata = self.result_generation_metadata.get(key)
+            original = self.generated_result_originals.get(key)
+            if not metadata or original is None:
+                continue
+            final_text = self.get_result_text_by_source(key)
+            final_hash = content_hash(final_text)
+            if metadata.get("last_correction_hash") == final_hash:
+                continue
+            self.quality_metrics_store.record_correction(
+                workflow=str(metadata.get("workflow") or key),
+                source=key,
+                generation_id=str(metadata.get("generation_id") or ""),
+                prompt_id=str(metadata.get("prompt_id") or ""),
+                prompt_name=str(metadata.get("prompt_name") or ""),
+                generated_text=original,
+                final_text=final_text,
+            )
+            metadata["last_correction_hash"] = final_hash
+
     def get_text(self, widget: tk.Text) -> str:
         state = str(widget.cget("state"))
         if state == tk.DISABLED:
@@ -7007,6 +10613,9 @@ class AssistantApp:
         widget.insert("1.0", value or "")
         if readonly or state == tk.DISABLED:
             widget.configure(state=tk.DISABLED)
+        self.schedule_text_widget_dependents(widget)
+
+    def schedule_text_widget_dependents(self, widget: tk.Text) -> None:
         if hasattr(self, "_message_source_widgets") and widget in self._message_source_widgets:
             self.schedule_message_refresh()
         if hasattr(self, "_secondary_message_source_widgets") and widget in self._secondary_message_source_widgets:
@@ -7017,9 +10626,28 @@ class AssistantApp:
             self.schedule_document_now_message_refresh()
 
     def get_clean_transcription_text(self) -> str:
-        return clean_transcription_text(self.get_text(self.transcription_text), self.config.get("transcription_cleaning", {}))
+        widget = self.transcription_text
+        if hasattr(self, "corrected_transcription_text") and self.get_text(self.corrected_transcription_text).strip():
+            widget = self.corrected_transcription_text
+        return clean_transcription_text(self.get_text(widget), self.config.get("transcription_cleaning", {}))
 
     def close(self) -> None:
+        self._closing = True
+        self.cancel_all_lmstudio_requests()
+        for job in (self._lmstudio_progress_job,):
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+        try:
+            self.save_last_transcription()
+        except Exception as exc:
+            self.log_debug("error", "app", "transcription_draft_save_error", str(exc))
+        try:
+            self.save_all_runtime_settings("close")
+        except Exception as exc:
+            self.log_debug("error", "app", "runtime_settings_close_save_error", str(exc))
         self.set_recording_indicator(False)
         self.uninstall_fly_dictation_hotkey()
         if self._fly_recorder:
@@ -7031,12 +10659,13 @@ class AssistantApp:
             self.session.stop()
         if self.server:
             self.server.stop()
+        self.stop_tray_icon()
         self.root.destroy()
 
 
 def main() -> None:
     root = tk.Tk()
-    app = AssistantApp(root)
+    _app = AssistantApp(root)
     root.mainloop()
 
 

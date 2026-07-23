@@ -5,8 +5,18 @@ from typing import Iterable
 
 from stt_backends import FasterWhisperBackend, Qwen3ASRBackend, VoxtralBackend
 from stt_backends.base import STTBackendError, format_text_with_speaker_mapping, normalize_stt_result
-from transcription_cleaner import DEFAULT_BLOCKED_LINE_PATTERNS, WHISPER_MEDICAL_INITIAL_PROMPT
+from transcription_cleaner import DEFAULT_BLOCKED_LINE_PATTERNS
 from whisper_model_manager import WhisperModelManager, canonical_french_whisper_model_name
+from medical_transcription import (
+    DEFAULT_MEDICAL_WHISPER_PROMPT,
+    DEFAULT_WHISPER_BEAM_SIZE,
+    DEFAULT_WHISPER_COMPUTE_TYPE,
+    DEFAULT_WHISPER_DEVICE,
+    DEFAULT_WHISPER_MODEL,
+    DEFAULT_WHISPER_TEMPERATURE,
+    TRANSCRIPTION_OVERLAP_SECONDS,
+    TRANSCRIPTION_WINDOW_SECONDS,
+)
 
 
 FASTER_WHISPER_ENGINE_ID = "faster-whisper"
@@ -51,17 +61,17 @@ DEFAULT_STT_CONFIG = {
     },
     "faster_whisper": {
         "enabled": True,
-        "model": "medium",
-        "device": "cpu",
-        "compute_type": "int8",
+        "model": DEFAULT_WHISPER_MODEL,
+        "device": DEFAULT_WHISPER_DEVICE,
+        "compute_type": DEFAULT_WHISPER_COMPUTE_TYPE,
         "language": "fr",
         "task": "transcribe",
         "force_language": True,
         "disable_language_detection": True,
-        "segment_seconds": 15,
-        "overlap_seconds": 1,
-        "temperature": 0.0,
-        "beam_size": 5,
+        "segment_seconds": TRANSCRIPTION_WINDOW_SECONDS,
+        "overlap_seconds": TRANSCRIPTION_OVERLAP_SECONDS,
+        "temperature": DEFAULT_WHISPER_TEMPERATURE,
+        "beam_size": DEFAULT_WHISPER_BEAM_SIZE,
         "vad_filter": True,
         "vad_parameters": {
             "min_silence_duration_ms": 700,
@@ -73,7 +83,7 @@ DEFAULT_STT_CONFIG = {
         "no_speech_threshold": 0.6,
         "log_prob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
-        "initial_prompt": WHISPER_MEDICAL_INITIAL_PROMPT,
+        "initial_prompt": DEFAULT_MEDICAL_WHISPER_PROMPT,
     },
     "audio_filter": {
         "enabled": True,
@@ -312,10 +322,10 @@ def backend_config_for(config: dict, engine_id: str) -> dict:
             "audio_filter": dict(config.get("audio_filter", {})),
             "transcription_cleaning": dict(config.get("transcription_cleaning", {})),
             "model": canonical_french_whisper_model_name(
-                config.get("model") or faster.get("model") or legacy.get("default_model") or "medium"
+                config.get("model") or faster.get("model") or legacy.get("default_model") or DEFAULT_WHISPER_MODEL
             ),
-            "device": config.get("device") or faster.get("device") or legacy.get("device") or "cpu",
-            "compute_type": config.get("compute_type") or faster.get("compute_type") or legacy.get("compute_type") or "int8",
+            "device": config.get("device") or faster.get("device") or legacy.get("device") or DEFAULT_WHISPER_DEVICE,
+            "compute_type": config.get("compute_type") or faster.get("compute_type") or legacy.get("compute_type") or DEFAULT_WHISPER_COMPUTE_TYPE,
             "language": "fr",
             "task": "transcribe",
             "force_language": True,
@@ -327,6 +337,28 @@ def backend_config_for(config: dict, engine_id: str) -> dict:
             "runtime": "python",
             "mode": config.get("mode") or "segments",
         }
+        # `settings_override` is passed at the top level by short workflows
+        # such as fly dictation. Those values must win over the persisted
+        # main-transcription section (notably its longer prompt and hotwords).
+        for key in (
+            "beam_size",
+            "best_of",
+            "temperature",
+            "vad_filter",
+            "vad_parameters",
+            "min_silence_duration_ms",
+            "speech_pad_ms",
+            "without_timestamps",
+            "initial_prompt",
+            "hotwords",
+            "hotwords_count",
+            "max_new_tokens",
+            "no_speech_threshold",
+            "log_prob_threshold",
+            "compression_ratio_threshold",
+        ):
+            if key in config and config[key] is not None:
+                merged[key] = config[key]
         return merged
 
     section = dict(config.get(target, {}))

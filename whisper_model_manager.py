@@ -5,6 +5,12 @@ import site
 import threading
 from dataclasses import dataclass
 
+from medical_transcription import (
+    DEFAULT_WHISPER_COMPUTE_TYPE,
+    DEFAULT_WHISPER_DEVICE,
+    DEFAULT_WHISPER_MODEL,
+)
+
 
 FRENCH_SAFE_WHISPER_FALLBACK_MODEL = "large-v3"
 FRENCH_UNSAFE_WHISPER_MODEL_ALIASES = {
@@ -21,17 +27,17 @@ _DLL_DIRECTORIES_CONFIGURED = False
 
 @dataclass(frozen=True)
 class WhisperSettings:
-    model_name: str = "medium"
-    device: str = "cpu"
-    compute_type: str = "int8"
+    model_name: str = DEFAULT_WHISPER_MODEL
+    device: str = DEFAULT_WHISPER_DEVICE
+    compute_type: str = DEFAULT_WHISPER_COMPUTE_TYPE
     cpu_threads: int = 16
 
     @classmethod
     def from_mapping(cls, data: dict) -> "WhisperSettings":
         return cls(
-            model_name=canonical_french_whisper_model_name(data.get("model") or data.get("default_model") or "medium"),
-            device=str(data.get("device") or "cpu"),
-            compute_type=str(data.get("compute_type") or "int8"),
+            model_name=canonical_french_whisper_model_name(data.get("model") or data.get("default_model") or DEFAULT_WHISPER_MODEL),
+            device=str(data.get("device") or DEFAULT_WHISPER_DEVICE),
+            compute_type=str(data.get("compute_type") or DEFAULT_WHISPER_COMPUTE_TYPE),
             cpu_threads=int(data.get("cpu_threads") or 16),
         )
 
@@ -83,7 +89,7 @@ class WhisperModelManager:
             self._active_settings = None
 
 
-def canonical_french_whisper_model_name(value: str, default: str = "medium") -> str:
+def canonical_french_whisper_model_name(value: str, default: str = DEFAULT_WHISPER_MODEL) -> str:
     requested = str(value or "").strip() or default
     normalized = requested.lower()
     if normalized in FRENCH_UNSAFE_WHISPER_MODEL_ALIASES:

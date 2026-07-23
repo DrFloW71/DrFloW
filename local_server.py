@@ -30,6 +30,11 @@ class LocalServer:
         connector_start_handler=None,
         connector_stop_handler=None,
         connector_status_provider=None,
+        connector_document_now_handler=None,
+        connector_document_now_status_provider=None,
+        context_refresh_provider=None,
+        context_refresh_claim_handler=None,
+        context_refresh_ack_handler=None,
         fly_dictation_start_handler=None,
         fly_dictation_stop_handler=None,
         fly_dictation_status_provider=None,
@@ -46,6 +51,11 @@ class LocalServer:
         self.connector_start_handler = connector_start_handler
         self.connector_stop_handler = connector_stop_handler
         self.connector_status_provider = connector_status_provider
+        self.connector_document_now_handler = connector_document_now_handler
+        self.connector_document_now_status_provider = connector_document_now_status_provider
+        self.context_refresh_provider = context_refresh_provider
+        self.context_refresh_claim_handler = context_refresh_claim_handler
+        self.context_refresh_ack_handler = context_refresh_ack_handler
         self.fly_dictation_start_handler = fly_dictation_start_handler
         self.fly_dictation_stop_handler = fly_dictation_stop_handler
         self.fly_dictation_status_provider = fly_dictation_status_provider
@@ -97,6 +107,11 @@ class LocalServer:
                         {"has_context": context is not None},
                     )
                     self._send_json({"ok": True, "context": context})
+                    return
+
+                if parsed.path == "/weda/context-refresh-request":
+                    request = state.context_refresh_provider() if state.context_refresh_provider else None
+                    self._send_json({"ok": True, "request": request})
                     return
 
                 if parsed.path == "/settings":
@@ -155,6 +170,17 @@ class LocalServer:
                     self._send_json({"ok": True, "job": job})
                     return
 
+                if parsed.path == "/connector/document-now/status":
+                    query = parse_qs(parsed.query)
+                    job_id = (query.get("job_id") or query.get("jobId") or [""])[0]
+                    job = (
+                        state.connector_document_now_status_provider(job_id)
+                        if state.connector_document_now_status_provider
+                        else None
+                    )
+                    self._send_json({"ok": True, "job": job})
+                    return
+
                 if parsed.path == "/fly-dictation/status":
                     fly = state.fly_dictation_status_provider() if state.fly_dictation_status_provider else None
                     self._send_json({"ok": True, "fly_dictation": fly})
@@ -185,9 +211,28 @@ class LocalServer:
                     self._send_json({"ok": True, "context": context})
                     return
 
+                if parsed.path == "/weda/context-refresh-claim":
+                    result = (
+                        state.context_refresh_claim_handler(payload)
+                        if state.context_refresh_claim_handler
+                        else {"claimed": False, "reason": "handler_unavailable"}
+                    )
+                    self._send_json({"ok": True, **result})
+                    return
+
+                if parsed.path == "/weda/context-refresh-ack":
+                    result = (
+                        state.context_refresh_ack_handler(payload)
+                        if state.context_refresh_ack_handler
+                        else {"accepted": False, "reason": "handler_unavailable"}
+                    )
+                    self._send_json({"ok": True, **result})
+                    return
+
                 if parsed.path == "/weda/import-request":
                     request = state.import_manager.prepare_result(
                         str(payload.get("result_text") or payload.get("resultText") or ""),
+                        result_html=str(payload.get("result_html") or payload.get("resultHtml") or ""),
                         patient_id=str(payload.get("patient_id") or payload.get("patientId") or ""),
                         patient_identity=str(payload.get("patient_identity") or payload.get("patientIdentity") or ""),
                         destination=str(payload.get("destination") or "active_field"),
@@ -203,6 +248,7 @@ class LocalServer:
                             "patient_identity": request.patient_identity,
                             "destination": request.destination,
                             "result_length": len(request.result_text or ""),
+                            "result_html_length": len(request.result_html or ""),
                         },
                     )
                     self._send_json({"ok": True, "request": request})
@@ -260,6 +306,22 @@ class LocalServer:
                         "connector",
                         "connector_stop_http",
                         "Arrêt connecteur reçu.",
+                        {"job_id": job.get("id", "") if isinstance(job, dict) else ""},
+                    )
+                    self._send_json({"ok": True, "job": job})
+                    return
+
+                if parsed.path == "/connector/document-now":
+                    job = (
+                        state.connector_document_now_handler(payload)
+                        if state.connector_document_now_handler
+                        else None
+                    )
+                    state._log(
+                        "info",
+                        "connector",
+                        "connector_document_now_http",
+                        "Déclenchement Document maintenant reçu.",
                         {"job_id": job.get("id", "") if isinstance(job, dict) else ""},
                     )
                     self._send_json({"ok": True, "job": job})

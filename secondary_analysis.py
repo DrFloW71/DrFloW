@@ -12,6 +12,7 @@ TERTIARY_ANALYSIS_PROMPT_NAME = "Analyse tertiaire"
 DEFAULT_SECONDARY_ANALYSIS_CONFIG = {
     "enabled": False,
     "default_prompt_id": SECONDARY_ANALYSIS_PROMPT_ID,
+    "last_prompt_id": SECONDARY_ANALYSIS_PROMPT_ID,
     "auto_run_after_primary": True,
     "include_transcription": True,
     "include_weda_context": True,
@@ -41,6 +42,7 @@ RÉSULTAT 1 :
 DEFAULT_TERTIARY_ANALYSIS_CONFIG = {
     "enabled": False,
     "default_prompt_id": TERTIARY_ANALYSIS_PROMPT_ID,
+    "last_prompt_id": TERTIARY_ANALYSIS_PROMPT_ID,
     "auto_run_after_secondary": True,
     "include_transcription": True,
     "include_weda_context": True,
@@ -86,6 +88,7 @@ def normalize_secondary_analysis_config(config: Mapping[str, object] | None) -> 
     normalized["show_sent_message_2"] = bool(normalized.get("show_sent_message_2"))
     normalized["allow_manual_run"] = bool(normalized.get("allow_manual_run"))
     normalized["default_prompt_id"] = str(normalized.get("default_prompt_id") or SECONDARY_ANALYSIS_PROMPT_ID)
+    normalized["last_prompt_id"] = str(normalized.get("last_prompt_id") or normalized["default_prompt_id"])
     return normalized
 
 
@@ -102,6 +105,7 @@ def normalize_tertiary_analysis_config(config: Mapping[str, object] | None) -> d
     normalized["show_sent_message_3"] = bool(normalized.get("show_sent_message_3"))
     normalized["allow_manual_run"] = bool(normalized.get("allow_manual_run"))
     normalized["default_prompt_id"] = str(normalized.get("default_prompt_id") or TERTIARY_ANALYSIS_PROMPT_ID)
+    normalized["last_prompt_id"] = str(normalized.get("last_prompt_id") or normalized["default_prompt_id"])
     return normalized
 
 
