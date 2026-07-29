@@ -186,7 +186,7 @@
   "tertiary_analysis": {
     "enabled": true,
     "default_prompt_id": "19452c95da5c426eac6e4127b1f60d0c",
-    "last_prompt_id": "19452c95da5c426eac6e4127b1f60d0c",
+    "last_prompt_id": "2dd6aa6310e14f0a8a33cd3a0ad74bd3",
     "auto_run_after_secondary": true,
     "include_transcription": true,
     "include_weda_context": true,

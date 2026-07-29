@@ -35,6 +35,7 @@ from local_server import LocalServer
 from patient_safety import (
     PATIENT_SAFETY_BLOCKED,
     PATIENT_SAFETY_OK,
+    PATIENT_SAFETY_UNLOCKED,
     evaluate_patient_context,
     normalize_patient_id,
     patient_ids_match,
@@ -693,6 +694,8 @@ class AssistantApp:
         self.connector_document_now_key_var = tk.StringVar(
             value=str(connector_config.get("document_now_key") or "F8")
         )
+        self.patient_lock_enabled = False
+        self.patient_lock_source = "local"
         self.fly_dictation_enabled_var = tk.BooleanVar(value=bool(fly_dictation_config.get("enabled", True)))
         self.fly_dictation_key_var = tk.StringVar(value=str(fly_dictation_config.get("key") or "²"))
         self.fly_dictation_model_var = tk.StringVar(
@@ -742,8 +745,10 @@ class AssistantApp:
         self.lmstudio_status_var = tk.StringVar(value="LM Studio: prêt")
         self.lmstudio_progress_var = tk.StringVar(value="")
         self.weda_patient_status_var = tk.StringVar(value="Patient WEDA: non reçu")
-        self.patient_safety_title_var = tk.StringVar(value="Aucun dossier WEDA verrouillé")
-        self.patient_safety_detail_var = tk.StringVar(value="Récupère le contexte patient avant génération ou import WEDA.")
+        self.patient_safety_title_var = tk.StringVar(value="Mode libre — aucun patient requis")
+        self.patient_safety_detail_var = tk.StringVar(
+            value="Le contexte WEDA est ignoré tant que le connecteur n’est pas utilisé."
+        )
         self.import_status_var = tk.StringVar(value="Import WEDA: aucun")
         self.server_status_var = tk.StringVar(value="Serveur local: arrêté")
         self.log_status_var = tk.StringVar(value="Logs: prêts")
@@ -1502,8 +1507,8 @@ class AssistantApp:
         self.patient_safety_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
         self.patient_safety_badge = tk.Label(
             self.patient_safety_bar,
-            text="VERROUILLÉ",
-            bg="#991b1b",
+            text="MODE LIBRE",
+            bg="#0369a1",
             fg="#ffffff",
             font=("Segoe UI", 9, "bold"),
             padx=8,
@@ -1534,6 +1539,13 @@ class AssistantApp:
             side=tk.RIGHT,
             padx=(6, 0),
         )
+        self.patient_unlock_button = ttk.Button(
+            self.patient_safety_bar,
+            text="Mode libre actif",
+            command=self.unlock_patient_mode,
+            state=tk.DISABLED,
+        )
+        self.patient_unlock_button.pack(side=tk.RIGHT, padx=(6, 0))
 
         fly_bar = ttk.Frame(self.root, padding=(8, 0, 8, 6), style="Toolbar.TFrame")
         fly_bar.pack(side=tk.TOP, fill=tk.X)
@@ -2943,7 +2955,7 @@ class AssistantApp:
             self.log_debug("warning", "pdf", "pdf_source_preference_save_error", str(exc))
 
     def build_pdf_context_transcription_source_text(self, *, transcription_only: bool = False) -> str:
-        weda_context = self.get_text(self.context_text).strip()
+        weda_context = self.get_active_weda_context_text()
         transcription = self.get_clean_transcription_text()
         parts = []
         if not transcription_only and weda_context:
@@ -3177,7 +3189,7 @@ class AssistantApp:
                 "prompt_name": self.pdf_prompt_var.get(),
                 "prompt_type": "pdf_form_fill",
                 "transcription": self.get_clean_transcription_text(),
-                "weda_context": self.get_text(self.context_text),
+                "weda_context": self.get_active_weda_context_text(),
                 "sent_message": sent_message,
                 "lmstudio_result": self.get_text(self.result_text),
                 "result_1": self.get_text(self.result_text),
@@ -4050,11 +4062,13 @@ class AssistantApp:
                     else ""
                 ),
                 "transcription": self.get_clean_transcription_text(),
-                "weda_context": self.get_text(self.context_text),
+                "weda_context": self.get_active_weda_context_text(),
             }
         )
 
     def build_document_now_patient_details(self) -> str:
+        if not self.is_patient_lock_enabled():
+            return ""
         context = self.context_manager.get_latest()
         if not context:
             return ""
@@ -4097,7 +4111,7 @@ class AssistantApp:
             transcript_text=self.get_clean_transcription_text(),
             transcript_duration_seconds=transcript_duration_seconds,
             transcript_segment_count=transcript_segment_count,
-            weda_context=self.get_text(self.context_text).strip() or None,
+            weda_context=self.get_active_weda_context_text() or None,
             patient_details=self.build_document_now_patient_details() or None,
             date_today=date.today().strftime("%d/%m/%Y"),
             document_type="document_intermediaire",
@@ -4113,7 +4127,7 @@ class AssistantApp:
     def build_document_now_prompt_variables(self, snapshot: DocumentNowSnapshot) -> dict[str, str]:
         variables = self.build_prompt_variables()
         include_prompt = bool(self.include_prompt_var.get())
-        include_context = bool(self.include_context_var.get())
+        include_context = bool(self.include_context_var.get()) and self.is_patient_lock_enabled()
         include_transcription = bool(self.include_transcription_var.get())
         patient_details = (snapshot.patient_details or "") if include_prompt or include_context else ""
         snapshot_transcription = (snapshot.transcript_text or "") if include_transcription else ""
@@ -4282,6 +4296,7 @@ class AssistantApp:
         *,
         expected_patient_id: str = "",
     ) -> None:
+        self.set_patient_lock_mode(True, source="connector_weda")
         if self.document_now_running:
             raise RuntimeError("Une génération « Document maintenant » est déjà en cours.")
         if self.document_now_pending_checkpoints:
@@ -4296,8 +4311,9 @@ class AssistantApp:
             raise RuntimeError(
                 "Le patient WEDA actif ne correspond pas au contexte chargé dans DrFloW."
             )
-        if context is not None and not self.require_fresh_patient_context(
-            "Document maintenant depuis WEDA"
+        if not self.require_fresh_patient_context(
+            "Document maintenant depuis WEDA",
+            require_patient_id=True,
         ):
             raise RuntimeError("Le contexte patient WEDA doit être confirmé avant la génération.")
 
@@ -5469,7 +5485,7 @@ class AssistantApp:
             }
         )
         medical_config = dict(self.config.get("medical_transcription", {}))
-        weda_context = self.get_text(self.context_text) if hasattr(self, "context_text") else ""
+        weda_context = self.get_active_weda_context_text()
         include_weda_prompt = bool(
             self.whisper_include_weda_context_var.get()
             if hasattr(self, "whisper_include_weda_context_var")
@@ -6846,6 +6862,11 @@ class AssistantApp:
         if self.session and self.session.is_running():
             return
 
+        connector_mode = recording_source == "connector"
+        self.set_patient_lock_mode(
+            connector_mode,
+            source="connector_weda" if connector_mode else "local_recording",
+        )
         self.dictation_run_id += 1
         run_id = self.dictation_run_id
         self.session = SegmentedDictationSession(
@@ -6939,6 +6960,7 @@ class AssistantApp:
         self.document_now_running = False
         self.configure_document_now_button_state()
         self.weda_patient_status_var.set("Patient WEDA: non reçu")
+        self.update_patient_safety_banner()
         self.transcription_status_var.set("Transcription prête")
         self.lmstudio_status_var.set("LM Studio: prêt")
         self.update_secondary_status()
@@ -7153,7 +7175,7 @@ class AssistantApp:
                 "whisper_model": self.model_manager.active_label(),
                 "prompt_name": self.prompt_var.get(),
                 "transcription": self.get_clean_transcription_text(),
-                "weda_context": self.get_text(self.context_text),
+                "weda_context": self.get_active_weda_context_text(),
                 "sent_message": message,
                 "lmstudio_result": result_payload.text,
                 "status": "connector_result_ready",
@@ -7185,7 +7207,28 @@ class AssistantApp:
                 self.wait_for_dictation_transcription(stopped_session)
 
             self.set_connector_job({"status": "generating", "message": "Envoi à LM Studio."})
+            self.call_ui_sync(
+                lambda: self.set_patient_lock_mode(True, source="connector_weda"),
+                timeout_seconds=10,
+            )
             self.call_ui_sync(self.refresh_context_from_manager, timeout_seconds=10)
+            context_ready = self.call_ui_sync(
+                lambda: self.require_fresh_patient_context(
+                    "Génération depuis le connecteur WEDA",
+                    require_patient_id=True,
+                ),
+                timeout_seconds=30,
+            )
+            if not context_ready:
+                raise RuntimeError("Le contexte patient WEDA doit être confirmé avant la génération.")
+            context = self.context_manager.get_latest()
+            expected_patient_id = normalize_patient_id(payload.get("patient_id"))
+            if (
+                expected_patient_id
+                and context is not None
+                and not patient_ids_match(context.patient_id, expected_patient_id)
+            ):
+                raise RuntimeError("Le patient WEDA actif ne correspond pas au contexte chargé dans DrFloW.")
             message = self.call_ui_sync(lambda: self.refresh_sent_message().strip(), timeout_seconds=10)
             if not message:
                 raise RuntimeError("Message LM Studio vide après arrêt de la dictée.")
@@ -8214,6 +8257,13 @@ class AssistantApp:
         return payload
 
     def capture_current_patient_binding(self) -> dict:
+        if not self.is_patient_lock_enabled():
+            return {
+                "patient_id": "",
+                "patient_identity": "",
+                "context_received_at": "",
+                "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            }
         context = self.context_manager.get_latest()
         return {
             "patient_id": normalize_patient_id(getattr(context, "patient_id", "")) if context else "",
@@ -8576,12 +8626,12 @@ class AssistantApp:
         return (message.rstrip() + "\n\n---\n" + block).strip()
 
     def build_prompt_variables(self) -> dict[str, str]:
-        context = self.context_manager.get_latest()
+        context = self.context_manager.get_latest() if self.is_patient_lock_enabled() else None
         include_prompt = bool(self.include_prompt_var.get())
-        include_context = bool(self.include_context_var.get())
+        include_context = bool(self.include_context_var.get()) and self.is_patient_lock_enabled()
         include_transcription = bool(self.include_transcription_var.get())
         include_context_metadata = include_prompt or include_context
-        weda_context = self.get_text(self.context_text).strip() if include_context else ""
+        weda_context = self.get_active_weda_context_text() if include_context else ""
         transcription = self.get_clean_transcription_text() if include_transcription else ""
         attachments = self.get_message_attachments_prompt_text()
         return {
@@ -9135,7 +9185,7 @@ class AssistantApp:
                 "prompt_3_error": prompt_3_error,
                 "prompt_name": self.prompt_var.get(),
                 "transcription": self.get_clean_transcription_text(),
-                "weda_context": self.get_text(self.context_text),
+                "weda_context": self.get_active_weda_context_text(),
                 "sent_message": sent_message_1,
                 "lmstudio_result": result_1,
                 "status": "lmstudio_response",
@@ -9574,10 +9624,45 @@ class AssistantApp:
         self.log_debug("error", "app", "lmstudio_error", str(error))
         messagebox.showerror("LM Studio", str(error), parent=self.root)
 
+    def is_patient_lock_enabled(self) -> bool:
+        return bool(getattr(self, "patient_lock_enabled", False))
+
+    def get_active_weda_context_text(self) -> str:
+        if not self.is_patient_lock_enabled() or not hasattr(self, "context_text"):
+            return ""
+        return self.get_text(self.context_text).strip()
+
+    def set_patient_lock_mode(self, enabled: bool, *, source: str) -> None:
+        enabled = bool(enabled)
+        changed = enabled != self.is_patient_lock_enabled()
+        self.patient_lock_enabled = enabled
+        self.patient_lock_source = str(source or "")
+        self.update_patient_safety_banner()
+        if hasattr(self, "schedule_message_refresh"):
+            self.schedule_message_refresh()
+            self.schedule_secondary_message_refresh()
+            self.schedule_tertiary_message_refresh()
+            self.schedule_document_now_message_refresh()
+        if changed:
+            self.log_debug(
+                "info",
+                "patient_safety",
+                "patient_lock_enabled" if enabled else "patient_lock_disabled",
+                "Verrou patient activé par le connecteur WEDA."
+                if enabled
+                else "Mode libre activé : aucun patient requis.",
+                {"source": self.patient_lock_source},
+            )
+
+    def unlock_patient_mode(self) -> None:
+        self.set_patient_lock_mode(False, source="manual_unlock")
+        self.import_status_var.set("Import WEDA: mode libre, aucun patient rattaché")
+
     def current_patient_safety_state(self, *, require_patient_id: bool = False):
         return evaluate_patient_context(
             self.context_manager.get_latest(),
             require_patient_id=require_patient_id,
+            lock_enabled=self.is_patient_lock_enabled(),
         )
 
     def update_patient_safety_banner(self) -> None:
@@ -9588,6 +9673,7 @@ class AssistantApp:
             return
         palette = {
             PATIENT_SAFETY_OK: ("#12372a", "#15803d", "PRÊT", "#bbf7d0"),
+            PATIENT_SAFETY_UNLOCKED: ("#0c4a6e", "#0369a1", "MODE LIBRE", "#bae6fd"),
             "warning": ("#3b2f0b", "#a16207", "ATTENTION", "#fde68a"),
             PATIENT_SAFETY_BLOCKED: ("#3b1014", "#991b1b", "VERROUILLÉ", "#fecaca"),
         }
@@ -9596,6 +9682,11 @@ class AssistantApp:
         self.patient_safety_badge.configure(bg=badge, text=badge_text)
         self.patient_safety_title_label.configure(bg=background)
         self.patient_safety_detail_label.configure(bg=background, fg=detail_color)
+        if hasattr(self, "patient_unlock_button"):
+            self.patient_unlock_button.configure(
+                text="Déverrouiller / sans patient" if self.is_patient_lock_enabled() else "Mode libre actif",
+                state=tk.NORMAL if self.is_patient_lock_enabled() else tk.DISABLED,
+            )
 
     def require_fresh_patient_context(self, action: str, *, require_patient_id: bool = False) -> bool:
         state = self.current_patient_safety_state(require_patient_id=require_patient_id)

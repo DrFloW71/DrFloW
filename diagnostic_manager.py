@@ -76,7 +76,7 @@ def run_drflow_diagnostics(
     )
     results.append(DiagnosticResult("ok" if stt_label else "warning", "Moteur STT", stt_label or "Non chargé"))
 
-    patient_status = "ok" if patient_context_state == "ok" else "warning"
+    patient_status = "ok" if patient_context_state in {"ok", "unlocked"} else "warning"
     results.append(DiagnosticResult(patient_status, "Verrou patient", patient_context_state or "inconnu"))
 
     lm_url = str(config.get("lmstudio", {}).get("url") or "")

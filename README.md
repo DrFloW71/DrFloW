@@ -66,6 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\install_git_hooks.ps1
 - Le message LM Studio distingue la transcription du jour du contexte WEDA, qui correspond aux consultations récentes et données médicales du dossier.
 - Taille de fenêtre mémorisée automatiquement après redimensionnement.
 - Bandeau permanent de verrou patient : identité du dossier, fraîcheur du contexte et PatDk restent visibles ; un résultat généré pour un autre dossier ne peut pas être préparé pour import WEDA.
+- Mode libre actif par défaut : une dictée lancée depuis DrFloW fonctionne sans patient et ignore le contexte WEDA. Le connecteur WEDA active automatiquement le verrou patient ; le bouton `Déverrouiller / sans patient` permet de revenir au mode libre.
 - Bouton `Diagnostic DrFloW` pour vérifier localement Python, configuration, micro, STT, LM Studio, serveur, pont WEDA et protections Git, avec rapport anonymisé copiable.
 - Annulation des générations LM Studio en cours, progression en temps réel et lecture des réponses en flux quand l’API locale le permet.
 - Historique local des versions de prompts, comparaison de versions/résultats et métriques techniques sans texte clinique dans `data/`.

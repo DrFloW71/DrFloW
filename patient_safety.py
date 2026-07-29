@@ -6,6 +6,7 @@ from dataclasses import dataclass
 PATIENT_SAFETY_OK = "ok"
 PATIENT_SAFETY_WARNING = "warning"
 PATIENT_SAFETY_BLOCKED = "blocked"
+PATIENT_SAFETY_UNLOCKED = "unlocked"
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,15 @@ def evaluate_patient_context(
     context,
     *,
     require_patient_id: bool = False,
+    lock_enabled: bool = True,
 ) -> PatientSafetyState:
+    if not lock_enabled and not require_patient_id:
+        return PatientSafetyState(
+            PATIENT_SAFETY_UNLOCKED,
+            "Mode libre — aucun patient requis",
+            "Le contexte WEDA affiché est ignoré et les résultats ne sont rattachés à aucun patient.",
+        )
+
     if context is None:
         return PatientSafetyState(
             PATIENT_SAFETY_BLOCKED,

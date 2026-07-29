@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -68,6 +67,8 @@ class ConnectorDocumentNowTests(unittest.TestCase):
             document_now_running=False,
             document_now_pending_checkpoints={},
             context_manager=SimpleNamespace(get_latest=Mock(return_value=None)),
+            set_patient_lock_mode=Mock(),
+            require_fresh_patient_context=Mock(return_value=True),
             session=session,
             set_document_now_connector_job=Mock(),
             document_now_status_var=Mock(),
@@ -78,6 +79,11 @@ class ConnectorDocumentNowTests(unittest.TestCase):
 
         AssistantApp.request_connector_document_now_checkpoint(app, "job-3")
 
+        app.set_patient_lock_mode.assert_called_once_with(True, source="connector_weda")
+        app.require_fresh_patient_context.assert_called_once_with(
+            "Document maintenant depuis WEDA",
+            require_patient_id=True,
+        )
         session.request_checkpoint.assert_called_once()
         checkpoint_id = session.request_checkpoint.call_args.args[0]
         self.assertEqual(

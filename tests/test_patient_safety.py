@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from patient_safety import (
     PATIENT_SAFETY_BLOCKED,
     PATIENT_SAFETY_OK,
+    PATIENT_SAFETY_UNLOCKED,
     PATIENT_SAFETY_WARNING,
     evaluate_patient_context,
     patient_ids_match,
@@ -40,6 +41,17 @@ class PatientSafetyTests(unittest.TestCase):
         self.assertTrue(state.allows_generation)
         strict = evaluate_patient_context(self.context(patient_id=""), require_patient_id=True)
         self.assertEqual(strict.level, PATIENT_SAFETY_BLOCKED)
+
+    def test_unlocked_mode_allows_generation_without_patient(self):
+        state = evaluate_patient_context(None, lock_enabled=False)
+        self.assertEqual(state.level, PATIENT_SAFETY_UNLOCKED)
+        self.assertTrue(state.allows_generation)
+        self.assertFalse(state.allows_import)
+
+    def test_import_stays_locked_without_patient_in_unlocked_mode(self):
+        state = evaluate_patient_context(None, require_patient_id=True, lock_enabled=False)
+        self.assertEqual(state.level, PATIENT_SAFETY_BLOCKED)
+        self.assertFalse(state.allows_import)
 
     def test_patient_id_comparison_uses_patdk_prefix(self):
         self.assertTrue(patient_ids_match("123|Nom", "123"))

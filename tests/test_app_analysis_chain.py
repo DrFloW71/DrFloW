@@ -94,6 +94,7 @@ class AnalysisChainTests(unittest.TestCase):
             prompt_var=Mock(),
             get_clean_transcription_text=Mock(return_value="Transcription"),
             get_text=Mock(return_value="Contexte WEDA"),
+            get_active_weda_context_text=Mock(return_value="Contexte WEDA"),
             context_text=context_widget,
             is_secondary_auto_run_enabled=Mock(return_value=True),
             log_debug=Mock(),
