@@ -7,7 +7,7 @@
     "segment_seconds": 30,
     "overlap_seconds": 2,
     "sample_rate": 16000,
-    "input_device": "",
+    "input_device": "1",
     "cpu_threads": 16,
     "beam_size": 5,
     "vad_filter": true,
@@ -62,7 +62,7 @@
     "log_prob_threshold": -1.0,
     "compression_ratio_threshold": 2.4,
     "initial_prompt": "Consultation de médecine générale en français entre un médecin et un patient. Transcription fidèle du dialogue médical : symptômes, évolution, négations, antécédents, traitements, posologies, allergies, examen clinique, résultats biologiques, dates, valeurs numériques et conseils donnés.",
-    "input_device": ""
+    "input_device": "1"
   },
   "audio_filter": {
     "enabled": true,
@@ -140,7 +140,7 @@
     "show_weda_context": true,
     "save_history": true,
     "window_width": 2368,
-    "window_height": 1133,
+    "window_height": 1072,
     "last_prompt_id": "2dd6aa6310e14f0a8a33cd3a0ad74bd3",
     "result_destination": "PDF structuré",
     "main_notebook_tab_order": [

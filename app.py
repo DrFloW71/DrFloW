@@ -135,6 +135,7 @@ LEGACY_TRANSCRIPTION_TAB_LABELS = {
 }
 DICTATION_TRANSCRIPTION_FLUSH_TIMEOUT_SECONDS = 180.0
 FLY_DICTATION_CLIPBOARD_RESTORE_DELAY_MS = 150
+FLY_DICTATION_SHORT_AUDIO_SECONDS = 10.0
 WEDA_CONTEXT_REFRESH_TIMEOUT_MS = 30000
 MESSAGE_ATTACHMENT_TEXT_SUFFIXES = {
     ".csv",
@@ -5867,7 +5868,7 @@ class AssistantApp:
                     fly_config.get("initial_prompt", DEFAULT_FLY_WHISPER_INITIAL_PROMPT)
                     or ""
                 ),
-                # La volée reste une dictée courte autonome : le contexte WEDA
+                # La volée reste une dictée autonome : le contexte WEDA
                 # et les hotwords de la consultation principale ne doivent pas
                 # consommer la fenêtre de décodage du modèle Turbo.
                 "hotwords": "",
@@ -5878,6 +5879,13 @@ class AssistantApp:
             settings["device"] = "cpu"
             settings["compute_type"] = "int8"
             settings["cuda_fallback_active"] = True
+        # Le filtre des segments longs ne doit pas rejeter un appui valide.
+        audio_filter = dict(self.config.get("audio_filter", {}))
+        audio_filter["min_duration_seconds"] = min(
+            float(audio_filter.get("min_duration_seconds") or 0.8),
+            float_setting("min_seconds", 0.2, 0.05, 5.0),
+        )
+        settings["audio_filter"] = audio_filter
         return settings
 
     def micro_device_label_for_value(self, value: str) -> str:
@@ -6395,7 +6403,7 @@ class AssistantApp:
                 "app",
                 "fly_dictation_recording_started",
                 "Enregistrement de dictée à la volée démarré.",
-                {"key": settings["key"], "sample_rate": recorder.sample_rate},
+                {"key": settings["key"], "sample_rate": recorder.sample_rate, "input_device": recorder.device},
             )
         except Exception as exc:
             self._fly_recorder = None
@@ -6429,7 +6437,25 @@ class AssistantApp:
             messagebox.showerror("Dictée à la volée", str(exc), parent=self.root)
             return
 
-        if duration_seconds < settings["min_seconds"] or len(audio) == 0:
+        if len(audio) == 0:
+            self._fly_busy = False
+            self.micro_status_var.set("Micro: aucune donnée audio")
+            self.fly_dictation_status_var.set("Volée: micro indisponible (vérifier le menu Micro)")
+            self.log_debug(
+                "error",
+                "app",
+                "fly_dictation_audio_missing",
+                "Le microphone n'a fourni aucune trame audio pendant la dictée à la volée.",
+                {
+                    "duration_seconds": round(duration_seconds, 3),
+                    "sample_rate": recorder.sample_rate,
+                    "input_device": recorder.device,
+                    "frames": 0,
+                },
+            )
+            return
+
+        if duration_seconds < settings["min_seconds"]:
             self._fly_busy = False
             self.fly_dictation_status_var.set("Volée: appui trop court")
             self.log_debug(
@@ -6484,6 +6510,21 @@ class AssistantApp:
         whisper_settings: dict,
         fallback_label: str,
     ):
+        whisper_settings = dict(whisper_settings or {})
+        audio_duration_seconds = len(audio) / sample_rate
+        if audio_duration_seconds > FLY_DICTATION_SHORT_AUDIO_SECONDS:
+            # Sans timestamps, Whisper avance de 30 s même si la limite de
+            # tokens a coupé la phrase. Le décodage complet et les timestamps
+            # permettent de reprendre à la dernière portion transcrite.
+            # 0 neutralise aussi une limite héritée de faster_whisper ; None
+            # serait ignoré par la fusion des réglages du moteur.
+            whisper_settings["max_new_tokens"] = 0
+            whisper_settings["without_timestamps"] = False
+            self.log_debug(
+                "info", "app", "fly_dictation_long_audio",
+                "Dictée à la volée longue : décodage complet avec repères temporels.",
+                {"audio_duration_seconds": round(audio_duration_seconds, 3)},
+            )
         temp_dir = None
         audio_path = None
         auto_delete_audio = bool(self.config.get("security", {}).get("auto_delete_audio", True))
@@ -6556,8 +6597,28 @@ class AssistantApp:
         self._fly_busy = False
         self.model_status_var.set(f"Moteur STT: {result.model_label}")
 
+        if result.text and not any(char.isalnum() for char in result.text):
+            self.fly_dictation_status_var.set("Volée: parole non reconnue (vérifier le menu Micro)")
+            self.log_debug(
+                "warning", "app", "fly_dictation_nonverbal_result",
+                "Whisper n'a produit que de la ponctuation ; aucun collage effectué.",
+                {
+                    "duration_seconds": round(duration_seconds, 3),
+                    "text_length": len(result.text),
+                    "audio_stats": getattr(result, "audio_stats", {}),
+                },
+            )
+            return
+
         if not result.text:
-            self.fly_dictation_status_var.set(f"Volée: aucun texte ({self.empty_segment_short_reason(result)})")
+            if getattr(result, "empty_reason", "") == "audio_silent_or_wrong_input_device":
+                stats = getattr(result, "audio_stats", {}) or {}
+                self.micro_status_var.set(
+                    f"Micro: signal faible / silence (RMS {float(stats.get('rms') or 0):.6f})"
+                )
+                self.fly_dictation_status_var.set("Volée: parole non détectée (vérifier le menu Micro et le niveau Windows)")
+            else:
+                self.fly_dictation_status_var.set(f"Volée: aucun texte ({self.empty_segment_short_reason(result)})")
             self.log_debug(
                 "warning",
                 "app",
@@ -6583,6 +6644,7 @@ class AssistantApp:
                 "elapsed_seconds": result.elapsed_seconds,
                 "text_length": len(result.text or ""),
                 "segments_count": getattr(result, "segments_count", 0),
+                "audio_stats": getattr(result, "audio_stats", {}),
             },
         )
         self.copy_and_paste_fly_dictation_text(result.text)

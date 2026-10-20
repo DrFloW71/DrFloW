@@ -81,6 +81,8 @@ class AudioRecorder:
 
 
 class PushToTalkRecorder:
+    FIRST_FRAME_TIMEOUT_SECONDS = 0.75
+
     def __init__(self, *, sample_rate: int = 16000, channels: int = 1, device=None):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -89,6 +91,7 @@ class PushToTalkRecorder:
         self._frames = []
         self._stream = None
         self._started_at = 0.0
+        self._first_frame = threading.Event()
 
     def start(self) -> None:
         try:
@@ -101,12 +104,14 @@ class PushToTalkRecorder:
 
         with self._lock:
             self._frames = []
+        self._first_frame.clear()
 
         def on_audio(indata, _frames, _time_info, _status):
             if indata is None or len(indata) == 0:
                 return
             with self._lock:
                 self._frames.append(indata.copy())
+            self._first_frame.set()
 
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -116,7 +121,24 @@ class PushToTalkRecorder:
             callback=on_audio,
         )
         self._started_at = time.perf_counter()
-        self._stream.start()
+        try:
+            self._stream.start()
+            # PortAudio peut ouvrir un périphérique Windows devenu indisponible
+            # sans erreur, mais ne jamais appeler le callback audio.
+            if not self._first_frame.wait(self.FIRST_FRAME_TIMEOUT_SECONDS):
+                raise RuntimeError(
+                    "Le microphone ne fournit aucune donnée audio. "
+                    "Vérifiez sa connexion et sélectionnez le bon périphérique dans le menu Micro de DrFloW."
+                )
+        except Exception:
+            stream = self._stream
+            self._stream = None
+            self._started_at = 0.0
+            try:
+                stream.close()
+            except Exception:
+                pass
+            raise
 
     def stop(self):
         stream = self._stream
