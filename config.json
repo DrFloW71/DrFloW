@@ -1,6 +1,6 @@
 {
   "whisper": {
-    "default_model": "large-v3",
+    "default_model": "large-v3-turbo",
     "device": "cuda",
     "compute_type": "float16",
     "language": "fr",
@@ -21,7 +21,7 @@
     "initial_prompt_name": "Médical général"
   },
   "stt": {
-    "default_engine": "voxtral",
+    "default_engine": "faster-whisper",
     "allow_experimental_engines": true,
     "keep_audio_for_benchmark": true,
     "auto_fallback_to_faster_whisper": true,
@@ -39,7 +39,7 @@
   },
   "faster_whisper": {
     "enabled": true,
-    "model": "large-v3",
+    "model": "large-v3-turbo",
     "device": "cuda",
     "compute_type": "float16",
     "language": "fr",
@@ -139,8 +139,8 @@
     "show_sent_message": true,
     "show_weda_context": true,
     "save_history": true,
-    "window_width": 2368,
-    "window_height": 1072,
+    "window_width": 1536,
+    "window_height": 845,
     "last_prompt_id": "2dd6aa6310e14f0a8a33cd3a0ad74bd3",
     "result_destination": "PDF structuré",
     "main_notebook_tab_order": [
